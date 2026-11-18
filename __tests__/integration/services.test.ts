@@ -1,5 +1,5 @@
 'use strict'
-import { describe, expect, it, jest } from '@jest/globals'
+import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import {
   ADDITION,
@@ -7,16 +7,20 @@ import {
   MODIFICATION,
 } from '../../src/constant/gitConstants'
 import { MetadataRepository } from '../../src/metadata/MetadataRepository'
+import { getDefinition } from '../../src/metadata/metadataManager'
 import TypeHandlerFactory from '../../src/service/typeHandlerFactory'
-import type { Work } from '../../src/types/work'
+import type { Config } from '../../src/types/config'
+import { ManifestTarget } from '../../src/types/handlerResult'
 import { pathExists, readDirs, readPathFromGit } from '../../src/utils/fsHelper'
-import { getGlobalMetadata } from '../__utils__/globalTestHelper'
+import { elementsOf } from '../__utils__/handlerResultView'
+import { sourceDirs } from '../__utils__/sourceDirs'
+import { getContext } from '../__utils__/testWork'
 
-jest.mock('../../src/utils/fsHelper')
+vi.mock('../../src/utils/fsHelper')
 
-const mockedReadPathFromGit = jest.mocked(readPathFromGit)
-const mockedReadDirs = jest.mocked(readDirs)
-const mockedPathExists = jest.mocked(pathExists)
+const mockedReadPathFromGit = vi.mocked(readPathFromGit)
+const mockedReadDirs = vi.mocked(readDirs)
+const mockedPathExists = vi.mocked(pathExists)
 
 const testContext = [
   [
@@ -25,9 +29,34 @@ const testContext = [
     'PermissionSet',
   ],
   [
+    'force-app/main/default/permissionsets/Admin/fieldPermissions/Account.Test__c.fieldPermission-meta.xml',
+    new Set(['Admin']),
+    'PermissionSet',
+  ],
+  [
+    'force-app/main/default/permissionsets/Admin/objectPermissions/Account.objectPermission-meta.xml',
+    new Set(['Admin']),
+    'PermissionSet',
+  ],
+  [
+    'force-app/main/default/permissionsets/Admin/classAccesses/MyClass.classAccess-meta.xml',
+    new Set(['Admin']),
+    'PermissionSet',
+  ],
+  [
     'force-app/main/default/sharingRules/Account/sharingCriteriaRules/TestSharingCriteria.sharingCriteriaRule-meta.xml',
     new Set(['Account.TestSharingCriteria']),
     'SharingCriteriaRule',
+  ],
+  [
+    'force-app/main/default/sharingRules/Account/sharingOwnerRules/TestOwnerRule.sharingOwnerRule-meta.xml',
+    new Set(['Account.TestOwnerRule']),
+    'SharingOwnerRule',
+  ],
+  [
+    'force-app/main/default/sharingRules/Account/sharingGuestRules/TestGuestRule.sharingGuestRule-meta.xml',
+    new Set(['Account.TestGuestRule']),
+    'SharingGuestRule',
   ],
   [
     'force-app/main/default/workflows/Account/workflowAlerts/TestWFAlert.workflowAlert-meta.xml',
@@ -38,6 +67,21 @@ const testContext = [
     'force-app/main/default/workflows/Account/workflowFlowActions/TestFlowAction.workflowFlowAction-meta.xml',
     new Set(['Account.TestFlowAction']),
     'WorkflowFlowAction',
+  ],
+  [
+    'force-app/main/default/workflows/Account/workflowFieldUpdates/TestFieldUpdate.workflowFieldUpdate-meta.xml',
+    new Set(['Account.TestFieldUpdate']),
+    'WorkflowFieldUpdate',
+  ],
+  [
+    'force-app/main/default/workflows/Account/workflowRules/TestRule.workflowRule-meta.xml',
+    new Set(['Account.TestRule']),
+    'WorkflowRule',
+  ],
+  [
+    'force-app/main/default/workflows/Account/workflowTasks/TestTask.workflowTask-meta.xml',
+    new Set(['Account.TestTask']),
+    'WorkflowTask',
   ],
   [
     'force-app/main/default/bots/TestBot/TestBot.bot-meta.xml',
@@ -121,6 +165,11 @@ const testContext = [
     `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><CustomLabels xmlns="http://soap.sforce.com/2006/04/metadata"></CustomLabels>`,
   ],
   [
+    'force-app/main/default/labels/TestLabel.label-meta.xml',
+    new Set(['TestLabel']),
+    'CustomLabel',
+  ],
+  [
     'force-app/main/default/assignmentRules/Account.assignmentRules-meta.xml',
     new Set(['Account.AccountRule']),
     'AssignmentRule',
@@ -185,6 +234,15 @@ const testContext = [
   ],
   [
     'force-app/main/default/objectTranslations/Account-fr/BillingFloor__c.fieldTranslation-meta.xml',
+    new Set(['Account-fr']),
+    'CustomObjectTranslation',
+    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><CustomObjectTranslation xmlns="http://soap.sforce.com/2006/04/metadata"><quickActions><label>Nouvelle Relation</label><name>NewRelationship</name></quickActions></CustomObjectTranslation>`,
+    `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><CustomObjectTranslation xmlns="http://soap.sforce.com/2006/04/metadata"></CustomObjectTranslation>`,
+  ],
+  // Flat layout: no component sub-folder. SDR resolves this to the same
+  // component ('Account-fr') as the sub-folder layout above.
+  [
+    'force-app/main/default/objectTranslations/Account-fr.objectTranslation-meta.xml',
     new Set(['Account-fr']),
     'CustomObjectTranslation',
     `<?xml version="1.0" encoding="UTF-8" standalone="yes"?><CustomObjectTranslation xmlns="http://soap.sforce.com/2006/04/metadata"><quickActions><label>Nouvelle Relation</label><name>NewRelationship</name></quickActions></CustomObjectTranslation>`,
@@ -266,6 +324,11 @@ const testContext = [
     'ExperienceBundle',
   ],
   [
+    'portals/experiences/component/subfolder/file.json',
+    new Set(['component']),
+    'ExperienceBundle',
+  ],
+  [
     'force-app/main/default/experiences/component-meta.xml',
     new Set(['component']),
     'ExperienceBundle',
@@ -279,6 +342,16 @@ const testContext = [
     'force-app/main/default/digitalExperiences/site/component/workspace/file.json',
     new Set(['site/component']),
     'DigitalExperienceBundle',
+  ],
+  [
+    'force-app/main/default/digitalExperiences/site/Site_A/Site_A.digitalExperience-meta.xml',
+    new Set(['site/Site_A']),
+    'DigitalExperienceBundle',
+  ],
+  [
+    'force-app/main/default/digitalExperiences/site/Site_A/sfdc_cms__view/page_a/content.json',
+    new Set(['site/Site_A.sfdc_cms__view/page_a']),
+    'DigitalExperience',
   ],
   [
     'force-app/main/default/quickActions/Account.New.quickAction-meta.xml',
@@ -461,6 +534,16 @@ const testContext = [
     'WaveXmd',
   ],
   [
+    'force-app/main/default/src-base/crma/wave/dashboards/Account_KPI_Dashboard.wdash',
+    new Set(['Account_KPI_Dashboard']),
+    'WaveDashboard',
+  ],
+  [
+    'force-app/main/default/src-base/crma/wave/components/AccountKpi.wcomp',
+    new Set(['AccountKpi']),
+    'WaveComponent',
+  ],
+  [
     'force-app/main/default/featureParameters/FeatureParameterIntegerTest.featureParameterInteger',
     new Set(['FeatureParameterIntegerTest']),
     'FeatureParameterInteger',
@@ -475,6 +558,21 @@ const testContext = [
     new Set(['FeatureParameterDateTest']),
     'FeatureParameterDate',
   ],
+  [
+    'force-app/main/default/email/TestFolder/TestEmail.email',
+    new Set(['TestFolder/TestEmail']),
+    'EmailTemplate',
+  ],
+  [
+    'force-app/main/default/email/TestFolder/TestEmail.email-meta.xml',
+    new Set(['TestFolder/TestEmail']),
+    'EmailTemplate',
+  ],
+  [
+    'force-app/main/default/email/TestFolder.emailFolder-meta.xml',
+    new Set(['TestFolder']),
+    'EmailTemplate',
+  ],
 ]
 const existingFiles = [
   'force-app/main/default/permissionsets/Admin/Admin.permissionset-meta.xml',
@@ -482,93 +580,237 @@ const existingFiles = [
 
 let globalMetadata: MetadataRepository
 beforeAll(async () => {
-  globalMetadata = await getGlobalMetadata()
+  globalMetadata = await getDefinition({})
 })
-let work: Work
+let config: Config
 let handlerFactory: TypeHandlerFactory
 beforeEach(() => {
-  jest.resetAllMocks()
-  work = {
-    config: {
-      output: '',
-      source: [''],
-      repo: '',
-      generateDelta: true,
-      to: '',
-      from: '',
-      ignore: '',
-      ignoreDestructive: '',
-      apiVersion: 0,
-      ignoreWhitespace: false,
-      include: '',
-      includeDestructive: '',
-    },
-    diffs: { package: new Map(), destructiveChanges: new Map() },
-    warnings: [],
+  vi.resetAllMocks()
+  config = {
+    output: '',
+    source: sourceDirs('.'),
+    repo: '',
+    generateDelta: true,
+    to: '',
+    from: '',
+    mergeBase: false,
+    ignore: '',
+    ignoreDestructive: '',
+    apiVersion: 0,
+    ignoreWhitespace: false,
+    include: '',
+    includeDestructive: '',
   }
-  handlerFactory = new TypeHandlerFactory(work, globalMetadata)
+  handlerFactory = new TypeHandlerFactory(
+    getContext({ config, metadata: globalMetadata })
+  )
 
+  mockedReadPathFromGit.mockResolvedValue('')
   mockedReadDirs.mockResolvedValue(existingFiles)
   mockedPathExists.mockImplementation(path => {
     return Promise.resolve(existingFiles.includes(path))
   })
 })
-describe.each(testContext)(`integration test %s`, (changePath:
-  | string
-  | Set<string>, expected: string | Set<string>, expectedType:
-  | string
-  | Set<string>, xmlTo: string | Set<string>, xmlFrom:
-  | string
-  | Set<string>) => {
-  it(`addition ${expectedType}`, async () => {
+describe.each(testContext)(
+  `integration test %s`,
+  (changePath: string | Set<string>, expected:
+    | string
+    | Set<string>, expectedType: string | Set<string>, xmlTo:
+    | string
+    | Set<string>, xmlFrom: string | Set<string>) => {
+    it(`addition ${expectedType}`, async () => {
+      // Arrange
+      if (xmlTo && xmlFrom) {
+        mockedReadPathFromGit.mockResolvedValueOnce(xmlTo as string)
+        mockedReadPathFromGit.mockResolvedValueOnce(xmlFrom as string)
+      }
+      const sut = await handlerFactory.getTypeHandler(
+        `${ADDITION}       ${changePath}`
+      )
+
+      // Act
+      const result = await sut.collect()
+
+      // Assert
+      const members = new Set(
+        elementsOf(result)
+          .filter(
+            m => m.target === ManifestTarget.Package && m.type === expectedType
+          )
+          .map(m => m.member)
+      )
+      expect(members).toEqual(expected)
+    })
+    it(`deletion ${expectedType}`, async () => {
+      // Arrange
+      if (xmlTo && xmlFrom) {
+        mockedReadPathFromGit.mockResolvedValueOnce(xmlFrom as string)
+        mockedReadPathFromGit.mockResolvedValueOnce(xmlTo as string)
+      }
+
+      mockedReadDirs.mockResolvedValue([])
+      mockedPathExists.mockResolvedValue(false)
+
+      const sut = await handlerFactory.getTypeHandler(
+        `${DELETION}       ${changePath}`
+      )
+
+      // Act
+      const result = await sut.collect()
+
+      // Assert
+      const members = new Set(
+        elementsOf(result)
+          .filter(
+            m =>
+              m.target === ManifestTarget.DestructiveChanges &&
+              m.type === expectedType
+          )
+          .map(m => m.member)
+      )
+      expect(members).toEqual(expected)
+    })
+    it(`modification ${expectedType}`, async () => {
+      // Arrange
+      if (xmlTo && xmlFrom) {
+        mockedReadPathFromGit.mockResolvedValueOnce(xmlTo as string)
+        mockedReadPathFromGit.mockResolvedValueOnce(xmlFrom as string)
+      }
+
+      const sut = await handlerFactory.getTypeHandler(
+        `${MODIFICATION}       ${changePath}`
+      )
+
+      // Act
+      const result = await sut.collect()
+
+      // Assert
+      const members = new Set(
+        elementsOf(result)
+          .filter(
+            m => m.target === ManifestTarget.Package && m.type === expectedType
+          )
+          .map(m => m.member)
+      )
+      expect(members).toEqual(expected)
+    })
+  }
+)
+
+describe('InFile container manifest under generateDelta=false', () => {
+  // End-to-end lock: real TypeHandlerFactory + real InFileHandler + real
+  // MetadataDiff. When a SharingRules file gains a new sharingCriteriaRules
+  // child while keeping pre-existing siblings, both the parent SharingRules
+  // entry AND the new SharingCriteriaRule member must appear in package.xml
+  // — even when generateDelta is off (the user-facing programmatic mode and
+  // the CLI default). Without the parent entry, Salesforce rejects the
+  // deploy with 'pre-existing sibling Not in package.xml'.
+  it('Given a new sharingCriteriaRules added to a file with an existing sibling and generateDelta=false, When the handler collects, Then both SharingRules and SharingCriteriaRule appear in the package manifest', async () => {
     // Arrange
-    if (xmlTo && xmlFrom) {
-      mockedReadPathFromGit.mockResolvedValueOnce(xmlTo as string)
-      mockedReadPathFromGit.mockResolvedValueOnce(xmlFrom as string)
-    }
-    const sut = handlerFactory.getTypeHandler(`${ADDITION}       ${changePath}`)
+    config.generateDelta = false
+    const path =
+      'force-app/main/default/sharingRules/Account.sharingRules-meta.xml'
+    const ns = 'xmlns="http://soap.sforce.com/2006/04/metadata"'
+    const header = '<?xml version="1.0" encoding="UTF-8"?>'
+    const fromXml = `${header}<SharingRules ${ns}><sharingCriteriaRules><fullName>Existing</fullName></sharingCriteriaRules></SharingRules>`
+    const toXml = `${header}<SharingRules ${ns}><sharingCriteriaRules><fullName>Existing</fullName></sharingCriteriaRules><sharingCriteriaRules><fullName>NewlyAdded</fullName></sharingCriteriaRules></SharingRules>`
+    mockedReadPathFromGit.mockResolvedValueOnce(toXml)
+    mockedReadPathFromGit.mockResolvedValueOnce(fromXml)
+    const sut = await handlerFactory.getTypeHandler(
+      `${MODIFICATION}       ${path}`
+    )
 
     // Act
-    await sut.handle()
+    const result = await sut.collect()
 
-    // Assert
-    expect(work.diffs.package.get(expectedType as string)).toEqual(expected)
-  })
-  it(`deletion ${expectedType}`, async () => {
-    // Arrange
-    if (xmlTo && xmlFrom) {
-      mockedReadPathFromGit.mockResolvedValueOnce(xmlFrom as string)
-      mockedReadPathFromGit.mockResolvedValueOnce(xmlTo as string)
-    }
-
-    mockedReadDirs.mockResolvedValue([])
-    mockedPathExists.mockResolvedValue(false)
-
-    const sut = handlerFactory.getTypeHandler(`${DELETION}       ${changePath}`)
-
-    // Act
-    await sut.handle()
-
-    // Assert
-    expect(work.diffs.destructiveChanges.get(expectedType as string)).toEqual(
-      expected as Set<string>
+    // Assert — package manifest must contain both the parent container
+    // and the newly added child sub-element.
+    const packageEntries = elementsOf(result).filter(
+      m => m.target === ManifestTarget.Package
+    )
+    expect(packageEntries).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: 'SharingRules', member: 'Account' }),
+        expect.objectContaining({
+          type: 'SharingCriteriaRule',
+          member: 'Account.NewlyAdded',
+        }),
+      ])
     )
   })
-  it(`modification ${expectedType}`, async () => {
-    // Arrange
-    if (xmlTo && xmlFrom) {
-      mockedReadPathFromGit.mockResolvedValueOnce(xmlTo as string)
-      mockedReadPathFromGit.mockResolvedValueOnce(xmlFrom as string)
-    }
 
-    const sut = handlerFactory.getTypeHandler(
-      `${MODIFICATION}       ${changePath}`
+  it('Given an existing sharingCriteriaRules whose content is modified and generateDelta=false, When the handler collects, Then both SharingRules and SharingCriteriaRule appear in the package manifest', async () => {
+    // Locks the recordModified flag-set path: when a child's content
+    // changes (no add, no delete), hasSurvivingChange must still flip
+    // and the parent must still go in package.xml.
+    config.generateDelta = false
+    const path =
+      'force-app/main/default/sharingRules/Account.sharingRules-meta.xml'
+    const ns = 'xmlns="http://soap.sforce.com/2006/04/metadata"'
+    const header = '<?xml version="1.0" encoding="UTF-8"?>'
+    const fromXml = `${header}<SharingRules ${ns}><sharingCriteriaRules><fullName>Existing</fullName><accessLevel>Read</accessLevel></sharingCriteriaRules></SharingRules>`
+    const toXml = `${header}<SharingRules ${ns}><sharingCriteriaRules><fullName>Existing</fullName><accessLevel>Edit</accessLevel></sharingCriteriaRules></SharingRules>`
+    mockedReadPathFromGit.mockResolvedValueOnce(toXml)
+    mockedReadPathFromGit.mockResolvedValueOnce(fromXml)
+    const sut = await handlerFactory.getTypeHandler(
+      `${MODIFICATION}       ${path}`
     )
 
     // Act
-    await sut.handle()
+    const result = await sut.collect()
 
     // Assert
-    expect(work.diffs.package.get(expectedType as string)).toEqual(expected)
+    const packageEntries = elementsOf(result).filter(
+      m => m.target === ManifestTarget.Package
+    )
+    expect(packageEntries).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ type: 'SharingRules', member: 'Account' }),
+        expect.objectContaining({
+          type: 'SharingCriteriaRule',
+          member: 'Account.Existing',
+        }),
+      ])
+    )
+  })
+
+  it('Given a sharingCriteriaRules removed in to (sibling preserved) and generateDelta=false, When the handler collects, Then the deleted child goes to destructiveChanges and the parent is NOT listed in either manifest', async () => {
+    // Locks deletion semantics: recordDeleted must NOT flip
+    // hasSurvivingChange. The deleted child belongs in
+    // destructiveChanges.xml only; the parent SharingRules file still
+    // exists on disk with its surviving sibling, so it must NOT appear
+    // in package.xml (nothing to deploy) NOR in destructiveChanges.xml
+    // (the file isn't being deleted, just one child).
+    config.generateDelta = false
+    const path =
+      'force-app/main/default/sharingRules/Account.sharingRules-meta.xml'
+    const ns = 'xmlns="http://soap.sforce.com/2006/04/metadata"'
+    const header = '<?xml version="1.0" encoding="UTF-8"?>'
+    const fromXml = `${header}<SharingRules ${ns}><sharingCriteriaRules><fullName>Kept</fullName></sharingCriteriaRules><sharingCriteriaRules><fullName>Gone</fullName></sharingCriteriaRules></SharingRules>`
+    const toXml = `${header}<SharingRules ${ns}><sharingCriteriaRules><fullName>Kept</fullName></sharingCriteriaRules></SharingRules>`
+    mockedReadPathFromGit.mockResolvedValueOnce(toXml)
+    mockedReadPathFromGit.mockResolvedValueOnce(fromXml)
+    const sut = await handlerFactory.getTypeHandler(
+      `${MODIFICATION}       ${path}`
+    )
+
+    // Act
+    const result = await sut.collect()
+
+    // Assert — child in destructiveChanges, no parent anywhere.
+    const elements = elementsOf(result)
+    const destructive = elements.filter(
+      m => m.target === ManifestTarget.DestructiveChanges
+    )
+    const packageEntries = elements.filter(
+      m => m.target === ManifestTarget.Package
+    )
+    expect(destructive).toEqual([
+      expect.objectContaining({
+        type: 'SharingCriteriaRule',
+        member: 'Account.Gone',
+      }),
+    ])
+    expect(packageEntries).toEqual([])
   })
 })

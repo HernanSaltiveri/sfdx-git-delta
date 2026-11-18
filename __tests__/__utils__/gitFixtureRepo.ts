@@ -1,0 +1,2124 @@
+'use strict'
+import { createHash } from 'node:crypto'
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs'
+import { tmpdir } from 'node:os'
+import { dirname, join, relative, sep } from 'node:path'
+
+import { runGit, runGitText } from './gitTestHarness.ts'
+
+// Building a fixture repo spawns dozens of blocking git processes: fixture
+// I/O, not the behaviour under test. A cold Windows runner outruns vitest's
+// 10s default hookTimeout doing it, so every hook that builds one takes this
+// budget while the tests keep the tight default and stay regression detectors.
+export const FIXTURE_HOOK_BUDGET_MS = 30_000
+
+export type RepoFormat = {
+  // The name that appears in vitest output, so a reduced run names itself.
+  readonly name: string
+  readonly refFormat: 'files' | 'reftable'
+  readonly objectFormat: 'sha1' | 'sha256'
+}
+
+export const FILES_SHA1: RepoFormat = {
+  name: 'files/sha1',
+  refFormat: 'files',
+  objectFormat: 'sha1',
+}
+export const REFTABLE_SHA1: RepoFormat = {
+  name: 'reftable/sha1',
+  refFormat: 'reftable',
+  objectFormat: 'sha1',
+}
+export const FILES_SHA256: RepoFormat = {
+  name: 'files/sha256',
+  refFormat: 'files',
+  objectFormat: 'sha256',
+}
+
+/**
+ * `dir` is already an empty directory. Only non-default dimensions are
+ * named on the command line: `--ref-format` landed in git 2.45, so passing
+ * it unconditionally would fail the baseline fixture — and the capability
+ * probe below, which reuses this function — on an older runner for no
+ * reason. Callers that pass no format get the exact invocation this file
+ * has always used.
+ */
+export const initRepo = (
+  dir: string,
+  format: RepoFormat = FILES_SHA1
+): void => {
+  const args = ['init', '--quiet']
+  if (format.refFormat !== FILES_SHA1.refFormat) {
+    args.push(`--ref-format=${format.refFormat}`)
+  }
+  if (format.objectFormat !== FILES_SHA1.objectFormat) {
+    args.push(`--object-format=${format.objectFormat}`)
+  }
+  runGit(args, { cwd: dir })
+}
+
+/**
+ * Builds a throwaway repository in a fresh temp directory to answer "does
+ * this runner's git binary support this ref/object format combination".
+ * The verdict is the handled outcome: an older git rejects an unknown
+ * `--ref-format`/`--object-format` value with a non-zero exit, which
+ * `execFileSync` surfaces as a thrown error, caught here and turned into
+ * `false` rather than failing the whole test file.
+ */
+export const isRepoFormatSupported = (format: RepoFormat): boolean => {
+  const probeDir = mkdtempSync(join(tmpdir(), 'sgd-format-probe-'))
+  try {
+    initRepo(probeDir, format)
+    return true
+  } catch {
+    return false
+  } finally {
+    rmSync(probeDir, { recursive: true, force: true })
+  }
+}
+
+export type FixtureRefs = {
+  // The very first commit — no parents.
+  root: string
+  // Baseline snapshot for the plain/whitespace diff scenarios.
+  diffFrom: string
+  // A/M(real)/M(whitespace-only)/D changes landed since `diffFrom`.
+  diffTo: string
+  // One commit past `diffTo`: a pure rename, content preserved.
+  renameTo: string
+  // HEAD — the last commit in the fixture.
+  head: string
+}
+
+export const GREP_MARKER = 'PARITY_MARKER_TOKEN'
+export const WHITESPACE_ONLY_PATH = 'src/index.txt'
+export const RENAME_FROM_PATH = 'src/lib/nested/deep.txt'
+export const RENAME_TO_PATH = 'src/lib/nested/renamed.txt'
+export const ARCHIVE_SCOPE = 'src'
+export const EXECUTABLE_PATH = 'scripts/run.sh'
+export const SYMLINK_PATH = 'assets/link-to-index'
+export const PREFIX_COLLISION_PATH = 'src-legacy/note.txt'
+export const REGISTRY_RECOGNISED_PATH = 'src/lib/FixtureClass.cls'
+
+type FileMode = '100644' | '100755' | '120000'
+
+type AddFile = { kind: 'add'; mode: FileMode; path: string; content: string }
+type DeleteFile = { kind: 'delete'; path: string }
+type RenameFile = { kind: 'rename'; from: string; to: string }
+export type FixtureOp = AddFile | DeleteFile | RenameFile
+
+const hashBlob = (dir: string, content: string): string =>
+  runGitText(['hash-object', '-w', '--stdin'], {
+    cwd: dir,
+    input: Buffer.from(content),
+  })
+
+const applyOp = (dir: string, op: FixtureOp): void => {
+  if (op.kind === 'add') {
+    const blobOid = hashBlob(dir, op.content)
+    runGit(
+      [
+        'update-index',
+        '--add',
+        '--cacheinfo',
+        `${op.mode},${blobOid},${op.path}`,
+      ],
+      { cwd: dir }
+    )
+    return
+  }
+  if (op.kind === 'delete') {
+    runGit(['update-index', '--force-remove', op.path], { cwd: dir })
+    return
+  }
+  const [mode, blobOid] = runGitText(['ls-files', '-s', op.from], {
+    cwd: dir,
+  }).split(/\s+/)
+  runGit(['update-index', '--force-remove', op.from], { cwd: dir })
+  runGit(
+    ['update-index', '--add', '--cacheinfo', `${mode},${blobOid},${op.to}`],
+    { cwd: dir }
+  )
+}
+
+// Plumbing-only commit construction (update-index --cacheinfo + write-tree +
+// commit-tree): the working tree is never checked out, so building an
+// executable file or a symlink never touches OS-level file permissions or
+// symlink support — both are pure git tree-entry modes (100755 / 120000)
+// recorded directly in the index.
+export const makeCommit = (
+  dir: string,
+  parent: string | null,
+  message: string,
+  ops: FixtureOp[]
+): string => {
+  for (const op of ops) applyOp(dir, op)
+  const treeOid = runGitText(['write-tree'], { cwd: dir })
+  const args = parent
+    ? ['commit-tree', treeOid, '-p', parent, '-m', message]
+    : ['commit-tree', treeOid, '-m', message]
+  return runGitText(args, { cwd: dir })
+}
+
+export type RefNameFixture = {
+  readonly branch: string // 'refs/heads/main'
+  readonly branchName: string // 'main'
+  readonly tag: string // 'refs/tags/v1'
+  readonly tagName: string // 'v1'
+  readonly tagOid: string // first commit
+  readonly headOid: string // second commit, what HEAD resolves to
+}
+
+const REF_NAME_BRANCH = 'refs/heads/main'
+const REF_NAME_BRANCH_NAME = 'main'
+const REF_NAME_TAG = 'refs/tags/v1'
+const REF_NAME_TAG_NAME = 'v1'
+
+/**
+ * Two commits so `tag` -> `branch` is a non-empty range: the first gets a
+ * lightweight tag (points straight at the commit, no tag-object peeling),
+ * the second becomes what `main` and `HEAD` resolve to. `symbolic-ref` — not
+ * `update-ref HEAD <sha>` — pins the branch name: `update-ref HEAD` writes
+ * through the symbolic HEAD into whatever branch `init.defaultBranch` chose
+ * on that runner (`main` or `master`), which would leave the very thing this
+ * fixture exists to pin runner-dependent.
+ */
+export const buildRefNameFixtureRepo = (
+  dir: string,
+  format: RepoFormat = FILES_SHA1
+): RefNameFixture => {
+  initRepo(dir, format)
+
+  const tagOid = makeCommit(dir, null, 'tagged commit', [
+    { kind: 'add', mode: '100644', path: 'README.md', content: 'first\n' },
+  ])
+  runGit(['update-ref', REF_NAME_TAG, tagOid], { cwd: dir })
+
+  const headOid = makeCommit(dir, tagOid, 'head commit', [
+    { kind: 'add', mode: '100644', path: 'src/index.txt', content: 'second\n' },
+  ])
+  runGit(['update-ref', REF_NAME_BRANCH, headOid], { cwd: dir })
+  runGit(['symbolic-ref', 'HEAD', REF_NAME_BRANCH], { cwd: dir })
+
+  return {
+    branch: REF_NAME_BRANCH,
+    branchName: REF_NAME_BRANCH_NAME,
+    tag: REF_NAME_TAG,
+    tagName: REF_NAME_TAG_NAME,
+    tagOid,
+    headOid,
+  }
+}
+
+/**
+ * Builds a fully self-contained history in `dir` (already an empty
+ * directory) — a dozen-ish commits reachable only from within this repo, so
+ * every scenario built on it is immune to the outer checkout's depth. Covers:
+ * nested directories, an executable file, a POSIX symlink (skipped on
+ * win32 — checking out a symlink tree entry through `git worktree add` is
+ * not guaranteed portable there), a whitespace-only modification paired
+ * with a real one, a genuine content-preserving rename, and enough depth
+ * for a non-degenerate shallow clone.
+ */
+export const buildFixtureRepo = (dir: string): FixtureRefs => {
+  initRepo(dir)
+
+  const root = makeCommit(dir, null, 'root', [
+    {
+      kind: 'add',
+      mode: '100644',
+      path: 'README.md',
+      content: 'the quick brown fox\n',
+    },
+    {
+      kind: 'add',
+      mode: '100644',
+      path: WHITESPACE_ONLY_PATH,
+      content: 'line one\nline two\n',
+    },
+    {
+      kind: 'add',
+      mode: '100644',
+      path: 'src/lib/util.txt',
+      content: 'utility content\n',
+    },
+    {
+      kind: 'add',
+      mode: '100644',
+      path: 'docs/notes.txt',
+      content: 'initial notes\n',
+    },
+  ])
+
+  const nested = makeCommit(dir, root, 'add nested file', [
+    {
+      kind: 'add',
+      mode: '100644',
+      path: RENAME_FROM_PATH,
+      content: 'deep content\n',
+    },
+  ])
+
+  const executable = makeCommit(dir, nested, 'add executable script', [
+    {
+      kind: 'add',
+      mode: '100755',
+      path: EXECUTABLE_PATH,
+      content: '#!/bin/sh\necho hi\n',
+    },
+  ])
+
+  const diffFrom =
+    process.platform === 'win32'
+      ? executable
+      : makeCommit(dir, executable, 'add symlink', [
+          {
+            kind: 'add',
+            mode: '120000',
+            path: SYMLINK_PATH,
+            content: WHITESPACE_ONLY_PATH,
+          },
+        ])
+
+  const withRealChange = makeCommit(
+    dir,
+    diffFrom,
+    'expand release notes and add scoping fixtures',
+    [
+      {
+        kind: 'add',
+        mode: '100644',
+        path: 'docs/notes.txt',
+        content: `initial notes\n${GREP_MARKER} present\n`,
+      },
+      {
+        kind: 'add',
+        mode: '100644',
+        path: PREFIX_COLLISION_PATH,
+        content: 'a sibling that merely shares a name prefix with src\n',
+      },
+      {
+        kind: 'add',
+        mode: '100644',
+        path: REGISTRY_RECOGNISED_PATH,
+        content: 'public class FixtureClass {}\n',
+      },
+    ]
+  )
+
+  const withWhitespaceOnlyChange = makeCommit(
+    dir,
+    withRealChange,
+    'reformat index (whitespace only)',
+    [
+      {
+        kind: 'add',
+        mode: '100644',
+        path: WHITESPACE_ONLY_PATH,
+        content: 'line one \nline two\n',
+      },
+    ]
+  )
+
+  const withDeletion = makeCommit(
+    dir,
+    withWhitespaceOnlyChange,
+    'drop unused util',
+    [{ kind: 'delete', path: 'src/lib/util.txt' }]
+  )
+
+  const diffTo = makeCommit(dir, withDeletion, 'add fixture marker file', [
+    {
+      kind: 'add',
+      mode: '100644',
+      path: 'src/lib/added.txt',
+      content: `added file with ${GREP_MARKER} too\n`,
+    },
+  ])
+
+  const renameTo = makeCommit(dir, diffTo, 'rename nested file', [
+    { kind: 'rename', from: RENAME_FROM_PATH, to: RENAME_TO_PATH },
+  ])
+
+  const expandedNotes = makeCommit(dir, renameTo, 'note the rename', [
+    {
+      kind: 'add',
+      mode: '100644',
+      path: 'docs/notes.txt',
+      content: `initial notes\n${GREP_MARKER} present\nrenamed the deep file\n`,
+    },
+  ])
+
+  const bumpedReadme = makeCommit(dir, expandedNotes, 'bump readme', [
+    {
+      kind: 'add',
+      mode: '100644',
+      path: 'README.md',
+      content: 'the quick brown fox jumps\n',
+    },
+  ])
+
+  const head = makeCommit(dir, bumpedReadme, 'add final fixture file', [
+    {
+      kind: 'add',
+      mode: '100644',
+      path: 'src/final.txt',
+      content: 'final content\n',
+    },
+  ])
+
+  runGit(['update-ref', 'HEAD', head], { cwd: dir })
+
+  return { root, diffFrom, diffTo, renameTo, head }
+}
+
+export type MetadataFixtureRefs = {
+  // The very first commit — no parents.
+  root: string
+  // HEAD — carries both the root commit's resource and a second one added
+  // on top of it.
+  head: string
+}
+
+export const EXISTING_RESOURCE_META =
+  'force-app/main/default/staticresources/ExistingResource/ExistingResource.resource-meta.xml'
+export const EXISTING_RESOURCE_FILE =
+  'force-app/main/default/staticresources/ExistingResource/images/logo.png'
+export const NEW_RESOURCE_META =
+  'force-app/main/default/staticresources/NewResource/NewResource.resource-meta.xml'
+export const NEW_RESOURCE_FILE =
+  'force-app/main/default/staticresources/NewResource/images/photo.png'
+
+/**
+ * A minimal SFDX-shaped history: a root commit carrying one nested
+ * StaticResource bundle, and a second commit adding a sibling bundle on top
+ * of it. Nested (bundle/subfolder/file) so metadata boundary resolution for
+ * files under it walks through the git-backed scan path rather than
+ * resolving in a single fromPath lookup — the shape the include path
+ * (ADDITION from the root commit, DELETION back to it) exercises.
+ */
+export const buildMetadataFixtureRepo = (dir: string): MetadataFixtureRefs => {
+  initRepo(dir)
+
+  const root = makeCommit(dir, null, 'add existing static resource', [
+    {
+      kind: 'add',
+      mode: '100644',
+      path: EXISTING_RESOURCE_META,
+      content:
+        '<StaticResource xmlns="http://soap.sforce.com/2006/04/metadata"/>\n',
+    },
+    {
+      kind: 'add',
+      mode: '100644',
+      path: EXISTING_RESOURCE_FILE,
+      content: 'logo content\n',
+    },
+  ])
+
+  const head = makeCommit(dir, root, 'add new static resource', [
+    {
+      kind: 'add',
+      mode: '100644',
+      path: NEW_RESOURCE_META,
+      content:
+        '<StaticResource xmlns="http://soap.sforce.com/2006/04/metadata"/>\n',
+    },
+    {
+      kind: 'add',
+      mode: '100644',
+      path: NEW_RESOURCE_FILE,
+      content: 'photo content\n',
+    },
+  ])
+
+  runGit(['update-ref', 'HEAD', head], { cwd: dir })
+
+  return { root, head }
+}
+
+export type RootAnchoredFixtureRefs = {
+  // Adds the class pair, the aura bundle, the lwc bundle, and a plain class
+  // sitting at the repository root with no directory above it.
+  root: string
+  // From `root`: deletes the class pair and both bundles, leaves the
+  // root-level class untouched.
+  deleted: string
+  // From `root`: renames the root-level class into `classes/`.
+  moved: string
+}
+
+export const ROOT_ANCHORED_CLASS = 'classes/AccountService.cls'
+export const ROOT_ANCHORED_CLASS_META = 'classes/AccountService.cls-meta.xml'
+export const ROOT_ANCHORED_AURA_MARKUP = 'aura/accountCard/accountCard.cmp'
+export const ROOT_ANCHORED_AURA_CONTROLLER =
+  'aura/accountCard/accountCardController.js'
+export const ROOT_ANCHORED_BUNDLE_MARKUP = 'lwc/accountCard/accountCard.html'
+export const ROOT_ANCHORED_BUNDLE_SCRIPT = 'lwc/accountCard/accountCard.js'
+export const ROOT_ANCHORED_BUNDLE_META =
+  'lwc/accountCard/accountCard.js-meta.xml'
+export const ROOT_ANCHORED_MOVED_CLASS = 'Ledger.cls'
+export const ROOT_ANCHORED_MOVED_CLASS_TO = 'classes/Ledger.cls'
+
+/**
+ * A package laid out at the repository root (no `force-app/main/default`
+ * prefix): every metadata type directory sits in path segment 0, exactly
+ * where a git diff-status letter and tab also land. The aura and lwc
+ * bundles carry no registry-known suffix, so only the directory walk can
+ * recognise them; `Ledger.cls` at the root is the shape whose diff-line key
+ * carries the status prefix inside it today.
+ */
+export const buildRootAnchoredFixtureRepo = (
+  dir: string
+): RootAnchoredFixtureRefs => {
+  initRepo(dir)
+
+  const root = makeCommit(dir, null, 'root', [
+    {
+      kind: 'add',
+      mode: '100644',
+      path: ROOT_ANCHORED_CLASS,
+      content: 'public class AccountService {}\n',
+    },
+    {
+      kind: 'add',
+      mode: '100644',
+      path: ROOT_ANCHORED_CLASS_META,
+      content: '<ApexClass xmlns="http://soap.sforce.com/2006/04/metadata"/>\n',
+    },
+    {
+      kind: 'add',
+      mode: '100644',
+      path: ROOT_ANCHORED_AURA_MARKUP,
+      content: '<aura:component/>\n',
+    },
+    {
+      kind: 'add',
+      mode: '100644',
+      path: ROOT_ANCHORED_AURA_CONTROLLER,
+      content: '({})\n',
+    },
+    {
+      kind: 'add',
+      mode: '100644',
+      path: ROOT_ANCHORED_BUNDLE_MARKUP,
+      content: '<template></template>\n',
+    },
+    {
+      kind: 'add',
+      mode: '100644',
+      path: ROOT_ANCHORED_BUNDLE_SCRIPT,
+      content: 'export default class {}\n',
+    },
+    {
+      kind: 'add',
+      mode: '100644',
+      path: ROOT_ANCHORED_BUNDLE_META,
+      content:
+        '<LightningComponentBundle xmlns="http://soap.sforce.com/2006/04/metadata"/>\n',
+    },
+    {
+      kind: 'add',
+      mode: '100644',
+      path: ROOT_ANCHORED_MOVED_CLASS,
+      content: 'public class Ledger {}\n',
+    },
+  ])
+
+  const deleted = makeCommit(dir, root, 'delete class and bundles', [
+    { kind: 'delete', path: ROOT_ANCHORED_CLASS },
+    { kind: 'delete', path: ROOT_ANCHORED_CLASS_META },
+    { kind: 'delete', path: ROOT_ANCHORED_AURA_MARKUP },
+    { kind: 'delete', path: ROOT_ANCHORED_AURA_CONTROLLER },
+    { kind: 'delete', path: ROOT_ANCHORED_BUNDLE_MARKUP },
+    { kind: 'delete', path: ROOT_ANCHORED_BUNDLE_SCRIPT },
+    { kind: 'delete', path: ROOT_ANCHORED_BUNDLE_META },
+  ])
+
+  // `deleted` above left the index holding its own tree, not `root`'s — the
+  // index is a single persistent file across these plumbing-only commits,
+  // not reset per commit. Re-seed it from `root` so this sibling commit
+  // branches off `root` instead of continuing from `deleted`.
+  runGit(['read-tree', root], { cwd: dir })
+
+  const moved = makeCommit(dir, root, 'move class out of the repository root', [
+    {
+      kind: 'rename',
+      from: ROOT_ANCHORED_MOVED_CLASS,
+      to: ROOT_ANCHORED_MOVED_CLASS_TO,
+    },
+  ])
+
+  return { root, deleted, moved }
+}
+
+export type IgnoreFixtureRefs = {
+  // Adds the class pair and the lwc bundle under the source directory.
+  root: string
+  // From `root`: renames both class files into the sibling recycle-bin directory.
+  moved: string
+  // From `root`: renames one bundle file into the recycle-bin directory while
+  // the bundle's two other files stay where they are — a stale ignored copy
+  // of a component that is still alive.
+  staleCopy: string
+  // From `root`: the class pair removed outright, nothing re-added.
+  deleted: string
+}
+
+export const IGNORE_SOURCE_CLASS =
+  'force-app/main/default/classes/AccountService.cls'
+export const IGNORE_SOURCE_CLASS_META =
+  'force-app/main/default/classes/AccountService.cls-meta.xml'
+export const IGNORE_MOVED_CLASS =
+  'force-app/recycle-bin/classes/AccountService.cls'
+export const IGNORE_MOVED_CLASS_META =
+  'force-app/recycle-bin/classes/AccountService.cls-meta.xml'
+const IGNORE_BUNDLE_SCRIPT = 'force-app/main/default/lwc/foo/foo.js'
+export const IGNORE_BUNDLE_MARKUP = 'force-app/main/default/lwc/foo/foo.html'
+const IGNORE_BUNDLE_META = 'force-app/main/default/lwc/foo/foo.js-meta.xml'
+export const IGNORE_BUNDLE_STALE_MARKUP =
+  'force-app/recycle-bin/lwc/foo/foo.html'
+
+/**
+ * A class and its meta companion, moved wholesale into a sibling directory —
+ * both paths resolve to the one ApexClass component, which is what the
+ * cancellation rule exists for. Exists to drive the real ignore-before/
+ * after-registration ordering against a fixture an `--ignore-file` pattern
+ * can target by directory. `root` also carries an untouched lwc bundle so a
+ * sibling commit can move just one of its files into the recycle bin,
+ * leaving the bundle live at `to` — a stale ignored copy rather than a move.
+ */
+export const buildIgnoreFixtureRepo = (dir: string): IgnoreFixtureRefs => {
+  initRepo(dir)
+
+  const root = makeCommit(dir, null, 'add class pair', [
+    {
+      kind: 'add',
+      mode: '100644',
+      path: IGNORE_SOURCE_CLASS,
+      content: 'public class AccountService {}\n',
+    },
+    {
+      kind: 'add',
+      mode: '100644',
+      path: IGNORE_SOURCE_CLASS_META,
+      content: '<ApexClass xmlns="http://soap.sforce.com/2006/04/metadata"/>\n',
+    },
+    {
+      kind: 'add',
+      mode: '100644',
+      path: IGNORE_BUNDLE_SCRIPT,
+      content: 'export default class {}\n',
+    },
+    {
+      kind: 'add',
+      mode: '100644',
+      path: IGNORE_BUNDLE_MARKUP,
+      content: '<template></template>\n',
+    },
+    {
+      kind: 'add',
+      mode: '100644',
+      path: IGNORE_BUNDLE_META,
+      content:
+        '<LightningComponentBundle xmlns="http://soap.sforce.com/2006/04/metadata"/>\n',
+    },
+  ])
+
+  const moved = makeCommit(dir, root, 'move class pair to the recycle bin', [
+    { kind: 'rename', from: IGNORE_SOURCE_CLASS, to: IGNORE_MOVED_CLASS },
+    {
+      kind: 'rename',
+      from: IGNORE_SOURCE_CLASS_META,
+      to: IGNORE_MOVED_CLASS_META,
+    },
+  ])
+
+  // `moved` above left the index holding its own tree, not `root`'s — the
+  // index is a single persistent file across these plumbing-only commits,
+  // not reset per commit. Re-seed it from `root` so this sibling commit
+  // branches off `root` instead of continuing from `moved`.
+  runGit(['read-tree', root], { cwd: dir })
+
+  const staleCopy = makeCommit(
+    dir,
+    root,
+    'move one bundle file to the recycle bin',
+    [
+      {
+        kind: 'rename',
+        from: IGNORE_BUNDLE_MARKUP,
+        to: IGNORE_BUNDLE_STALE_MARKUP,
+      },
+    ]
+  )
+
+  // `staleCopy` above left the index holding its own tree, not `root`'s —
+  // re-seed it from `root` so this sibling commit branches off `root`
+  // instead of continuing from `staleCopy`.
+  runGit(['read-tree', root], { cwd: dir })
+
+  const deleted = makeCommit(dir, root, 'delete the class pair', [
+    { kind: 'delete', path: IGNORE_SOURCE_CLASS },
+    { kind: 'delete', path: IGNORE_SOURCE_CLASS_META },
+  ])
+
+  return { root, moved, staleCopy, deleted }
+}
+
+export type LiveContainerFixtureRefs = {
+  // Parentless. Carries the `still` bundle so a run whose `from` IS the
+  // first commit indexes a revision where the forced-deletion target exists:
+  // the include DELETION pass must still read it as gone.
+  genesis: string
+  // Every other container shape, all alive.
+  root: string
+  // HEAD — one file deleted from each live container, one bundle deleted
+  // whole, one decomposed child deleted with its holder surviving.
+  head: string
+}
+
+// The default SFDX package layout, shared by every fixture below that
+// needs a realistic source path.
+const SFDX_DEFAULT_ROOT = 'force-app/main/default'
+const LIVE_ROOT = SFDX_DEFAULT_ROOT
+export const LIVE_STILL_SCRIPT = `${LIVE_ROOT}/lwc/still/still.js`
+export const LIVE_STILL_META = `${LIVE_ROOT}/lwc/still/still.js-meta.xml`
+export const LIVE_FOO_SCRIPT = `${LIVE_ROOT}/lwc/foo/foo.js`
+export const LIVE_FOO_META = `${LIVE_ROOT}/lwc/foo/foo.js-meta.xml`
+export const LIVE_FOO_MARKUP = `${LIVE_ROOT}/lwc/foo/foo.html`
+export const LIVE_GONE_SCRIPT = `${LIVE_ROOT}/lwc/gone/gone.js`
+export const LIVE_GONE_META = `${LIVE_ROOT}/lwc/gone/gone.js-meta.xml`
+export const LIVE_BAR_META = `${LIVE_ROOT}/staticresources/bar.resource-meta.xml`
+export const LIVE_BAR_A = `${LIVE_ROOT}/staticresources/bar/a.js`
+export const LIVE_BAR_B = `${LIVE_ROOT}/staticresources/bar/b.js`
+export const LIVE_DEEP_META = `${LIVE_ROOT}/staticresources/deep.resource-meta.xml`
+export const LIVE_DEEP_X = `${LIVE_ROOT}/staticresources/deep/sub/dir/x.js`
+export const LIVE_DEEP_Y = `${LIVE_ROOT}/staticresources/deep/sub/y.js`
+export const LIVE_ADMIN_META = `${LIVE_ROOT}/permissionsets/Admin/Admin.permissionset-meta.xml`
+export const LIVE_ADMIN_FIELD = `${LIVE_ROOT}/permissionsets/Admin/fieldPermissions/Account.Name.fieldPermission-meta.xml`
+export const LIVE_ADMIN_OBJECT = `${LIVE_ROOT}/permissionsets/Admin/objectPermissions/Account.objectPermission-meta.xml`
+export const LIVE_SITE_META = `${LIVE_ROOT}/digitalExperiences/site/mysite/mysite.digitalExperience-meta.xml`
+export const LIVE_PAGE_META = `${LIVE_ROOT}/digitalExperiences/site/mysite/sfdc_cms__view/about/_meta.json`
+export const LIVE_PAGE_CONTENT = `${LIVE_ROOT}/digitalExperiences/site/mysite/sfdc_cms__view/about/content.json`
+export const LIVE_PAGE_MOBILE = `${LIVE_ROOT}/digitalExperiences/site/mysite/sfdc_cms__view/about/mobile/content.json`
+export const LIVE_KEEP_CLASS = `${LIVE_ROOT}/classes/Keep.cls`
+export const LIVE_KEEP_META = `${LIVE_ROOT}/classes/Keep.cls-meta.xml`
+
+const LWC_META_CONTENT =
+  '<LightningComponentBundle xmlns="http://soap.sforce.com/2006/04/metadata"/>\n'
+const STATIC_RESOURCE_META_CONTENT =
+  '<StaticResource xmlns="http://soap.sforce.com/2006/04/metadata"/>\n'
+const PERMISSION_SET_META_CONTENT =
+  '<PermissionSet xmlns="http://soap.sforce.com/2006/04/metadata"/>\n'
+const DIGITAL_EXPERIENCE_META_CONTENT =
+  '<DigitalExperienceBundle xmlns="http://soap.sforce.com/2006/04/metadata"/>\n'
+const APEX_CLASS_META_CONTENT =
+  '<ApexClass xmlns="http://soap.sforce.com/2006/04/metadata"/>\n'
+
+/**
+ * Every live-container shape sgd knows how to reclassify from destructive to
+ * package when the component survives: a plain bundle (lwc), a bundle that
+ * dies whole (lwc), a decomposed-format container (permission set), and a
+ * shared-folder container (static resource, digital experience bundle). One
+ * file is deleted from each surviving container at `head`; `gone` loses both
+ * of its files and truly disappears. `still` lives only at `genesis`, the
+ * parentless commit — it exists so a run whose `--from` IS the first commit
+ * indexes a revision holding it (see manifestParityAcrossGenerateDelta.test.ts,
+ * Leg E).
+ */
+export const buildLiveContainerFixtureRepo = (
+  dir: string
+): LiveContainerFixtureRefs => {
+  initRepo(dir)
+
+  const genesis = makeCommit(dir, null, 'genesis', [
+    { kind: 'add', mode: '100644', path: 'README.md', content: 'genesis\n' },
+    {
+      kind: 'add',
+      mode: '100644',
+      path: LIVE_STILL_SCRIPT,
+      content: 'export default class {}\n',
+    },
+    {
+      kind: 'add',
+      mode: '100644',
+      path: LIVE_STILL_META,
+      content: LWC_META_CONTENT,
+    },
+  ])
+
+  const root = makeCommit(dir, genesis, 'root', [
+    {
+      kind: 'add',
+      mode: '100644',
+      path: LIVE_FOO_SCRIPT,
+      content: 'export default class {}\n',
+    },
+    {
+      kind: 'add',
+      mode: '100644',
+      path: LIVE_FOO_META,
+      content: LWC_META_CONTENT,
+    },
+    {
+      kind: 'add',
+      mode: '100644',
+      path: LIVE_FOO_MARKUP,
+      content: '<template></template>\n',
+    },
+    {
+      kind: 'add',
+      mode: '100644',
+      path: LIVE_GONE_SCRIPT,
+      content: 'export default class {}\n',
+    },
+    {
+      kind: 'add',
+      mode: '100644',
+      path: LIVE_GONE_META,
+      content: LWC_META_CONTENT,
+    },
+    {
+      kind: 'add',
+      mode: '100644',
+      path: LIVE_BAR_META,
+      content: STATIC_RESOURCE_META_CONTENT,
+    },
+    { kind: 'add', mode: '100644', path: LIVE_BAR_A, content: 'a\n' },
+    { kind: 'add', mode: '100644', path: LIVE_BAR_B, content: 'b\n' },
+    {
+      kind: 'add',
+      mode: '100644',
+      path: LIVE_DEEP_META,
+      content: STATIC_RESOURCE_META_CONTENT,
+    },
+    { kind: 'add', mode: '100644', path: LIVE_DEEP_X, content: 'x\n' },
+    { kind: 'add', mode: '100644', path: LIVE_DEEP_Y, content: 'y\n' },
+    {
+      kind: 'add',
+      mode: '100644',
+      path: LIVE_ADMIN_META,
+      content: PERMISSION_SET_META_CONTENT,
+    },
+    {
+      kind: 'add',
+      mode: '100644',
+      path: LIVE_ADMIN_FIELD,
+      content: PERMISSION_SET_META_CONTENT,
+    },
+    {
+      kind: 'add',
+      mode: '100644',
+      path: LIVE_ADMIN_OBJECT,
+      content: PERMISSION_SET_META_CONTENT,
+    },
+    {
+      kind: 'add',
+      mode: '100644',
+      path: LIVE_SITE_META,
+      content: DIGITAL_EXPERIENCE_META_CONTENT,
+    },
+    { kind: 'add', mode: '100644', path: LIVE_PAGE_META, content: '{}\n' },
+    { kind: 'add', mode: '100644', path: LIVE_PAGE_CONTENT, content: '{}\n' },
+    { kind: 'add', mode: '100644', path: LIVE_PAGE_MOBILE, content: '{}\n' },
+    {
+      kind: 'add',
+      mode: '100644',
+      path: LIVE_KEEP_CLASS,
+      content: 'public class Keep {}\n',
+    },
+    {
+      kind: 'add',
+      mode: '100644',
+      path: LIVE_KEEP_META,
+      content: APEX_CLASS_META_CONTENT,
+    },
+  ])
+
+  const head = makeCommit(dir, root, 'head', [
+    { kind: 'delete', path: LIVE_FOO_MARKUP },
+    { kind: 'delete', path: LIVE_GONE_SCRIPT },
+    { kind: 'delete', path: LIVE_GONE_META },
+    { kind: 'delete', path: LIVE_BAR_A },
+    { kind: 'delete', path: LIVE_DEEP_X },
+    { kind: 'delete', path: LIVE_ADMIN_FIELD },
+    { kind: 'delete', path: LIVE_PAGE_MOBILE },
+  ])
+
+  runGit(['update-ref', 'HEAD', head], { cwd: dir })
+
+  return { genesis, root, head }
+}
+
+export type InFileFanOutFixtureRefs = { base: string; head: string }
+
+export const IN_FILE_FAN_OUT_BASE_ALERT = 'A1'
+export const IN_FILE_FAN_OUT_ADDED_ALERT = 'A2'
+export const inFileFanOutWorkflowName = (index: number): string => `W${index}`
+export const inFileFanOutWorkflowPath = (index: number): string =>
+  `${LIVE_ROOT}/workflows/${inFileFanOutWorkflowName(index)}.workflow-meta.xml`
+
+const workflowXml = (alertNames: readonly string[]): string => {
+  const alerts = alertNames
+    .map(name => `  <alerts>\n    <fullName>${name}</fullName>\n  </alerts>\n`)
+    .join('')
+  return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n<Workflow xmlns="http://soap.sforce.com/2006/04/metadata">\n${alerts}</Workflow>\n`
+}
+
+const addWorkflow = (
+  index: number,
+  alertNames: readonly string[]
+): FixtureOp => ({
+  kind: 'add',
+  mode: '100644',
+  path: inFileFanOutWorkflowPath(index),
+  content: workflowXml(alertNames),
+})
+
+const oneBased = (count: number): number[] =>
+  Array.from({ length: count }, (_, offset) => offset + 1)
+
+/**
+ * `count` Workflow files, each with one alert at `base` and two at `head`, so
+ * every diff line is an inFile modification: the handler reads the file at
+ * both revisions, the type needs no tree index (empty scope, so
+ * buildRunTreeReader never pre-warms the memo), and the handler queue fans
+ * the first content read out across getConcurrencyThreshold() slots.
+ */
+export const buildInFileFanOutFixtureRepo = (
+  dir: string,
+  count: number
+): InFileFanOutFixtureRefs => {
+  initRepo(dir)
+  const base = makeCommit(
+    dir,
+    null,
+    'base',
+    oneBased(count).map(index =>
+      addWorkflow(index, [IN_FILE_FAN_OUT_BASE_ALERT])
+    )
+  )
+  const head = makeCommit(
+    dir,
+    base,
+    'head',
+    oneBased(count).map(index =>
+      addWorkflow(index, [
+        IN_FILE_FAN_OUT_BASE_ALERT,
+        IN_FILE_FAN_OUT_ADDED_ALERT,
+      ])
+    )
+  )
+  runGit(['update-ref', 'HEAD', head], { cwd: dir })
+  return { base, head }
+}
+
+export type UnreadableSubtreeFixtureRefs = { base: string; head: string }
+
+export const UNREADABLE_SUBTREE_PATH = `${LIVE_ROOT}/classes`
+export const UNREADABLE_SUBTREE_BUNDLE_SCRIPT = `${LIVE_ROOT}/lwc/foo/foo.js`
+export const UNREADABLE_SUBTREE_BUNDLE_META = `${LIVE_ROOT}/lwc/foo/foo.js-meta.xml`
+// GitCopy operations the modified bundle emits under --generate-delta: the
+// changed script plus its meta file (ResourceHandler always copies the meta).
+export const UNREADABLE_SUBTREE_COPY_COUNT = 2
+
+/**
+ * One LWC bundle modified between `base` and `head`, next to a `classes/`
+ * subtree that is byte-identical at both — so its single tree object can be
+ * removed (see unlinkTreeObjectAt) to make every full tree walk fail while
+ * the diff, which never opens an identical subtree, keeps working.
+ */
+export const buildUnreadableSubtreeFixtureRepo = (
+  dir: string
+): UnreadableSubtreeFixtureRefs => {
+  initRepo(dir)
+  const base = makeCommit(dir, null, 'base', [
+    {
+      kind: 'add',
+      mode: '100644',
+      path: UNREADABLE_SUBTREE_BUNDLE_SCRIPT,
+      content: 'export default class {}\n',
+    },
+    {
+      kind: 'add',
+      mode: '100644',
+      path: UNREADABLE_SUBTREE_BUNDLE_META,
+      content: LWC_META_CONTENT,
+    },
+    {
+      kind: 'add',
+      mode: '100644',
+      path: `${UNREADABLE_SUBTREE_PATH}/Keep.cls`,
+      content: 'public class Keep {}\n',
+    },
+    {
+      kind: 'add',
+      mode: '100644',
+      path: `${UNREADABLE_SUBTREE_PATH}/Keep.cls-meta.xml`,
+      content: APEX_CLASS_META_CONTENT,
+    },
+  ])
+  const head = makeCommit(dir, base, 'head', [
+    {
+      kind: 'add',
+      mode: '100644',
+      path: UNREADABLE_SUBTREE_BUNDLE_SCRIPT,
+      content: 'export default class { changed = true }\n',
+    },
+  ])
+  runGit(['update-ref', 'HEAD', head], { cwd: dir })
+  return { base, head }
+}
+
+/**
+ * Removes the loose object of the tree at `treePath` in `revision`. Objects
+ * are loose because every fixture here is built with plumbing
+ * (hash-object / write-tree / commit-tree), which never packs; the existence
+ * check turns that assumption into a loud failure instead of a vacuous test.
+ *
+ * `dir` must live under the OS temp dir: this deletes from a real object
+ * store, so containment is enforced rather than left to the caller's care.
+ */
+export const unlinkTreeObjectAt = (
+  dir: string,
+  revision: string,
+  treePath: string
+): void => {
+  const root = realpathSync(tmpdir())
+  const target = realpathSync(dir)
+  const inside = relative(root, target)
+  if (inside.startsWith('..') || inside.startsWith(sep) || inside === '') {
+    throw new Error(
+      `refusing to unlink git objects outside the temp dir: ${target}`
+    )
+  }
+  const oid = runGitText(['rev-parse', `${revision}:${treePath}`], {
+    cwd: dir,
+  })
+  const objectPath = join(dir, '.git', 'objects', oid.slice(0, 2), oid.slice(2))
+  if (!existsSync(objectPath)) {
+    throw new Error(
+      `expected a loose object for ${revision}:${treePath} at ${objectPath}`
+    )
+  }
+  unlinkSync(objectPath)
+}
+
+export type FolderMoveFixtureRefs = {
+  // Adds the report, dashboard, document and email-template components under
+  // their original folders, plus the report whose DeveloperName equals its
+  // own folder's name.
+  root: string
+  // From `root`: the folder moves — two reports and one dashboard keep their
+  // DeveloperName, one report and one dashboard are renamed on the way, and
+  // the document and the email template move too.
+  moved: string
+  // From `root`: the report named like its own folder moves to a new folder
+  // while its former folder descriptor is deleted.
+  folderCollapse: string
+}
+
+const FOLDER_MOVE_ROOT = SFDX_DEFAULT_ROOT
+
+const REPORT_FOLDER_META_CONTENT =
+  '<ReportFolder xmlns="http://soap.sforce.com/2006/04/metadata"/>\n'
+const REPORT_META_CONTENT =
+  '<Report xmlns="http://soap.sforce.com/2006/04/metadata"/>\n'
+const DASHBOARD_FOLDER_META_CONTENT =
+  '<DashboardFolder xmlns="http://soap.sforce.com/2006/04/metadata"/>\n'
+const DASHBOARD_META_CONTENT =
+  '<Dashboard xmlns="http://soap.sforce.com/2006/04/metadata"/>\n'
+const DOCUMENT_META_CONTENT =
+  '<Document xmlns="http://soap.sforce.com/2006/04/metadata"/>\n'
+const EMAIL_TEMPLATE_META_CONTENT =
+  '<EmailTemplate xmlns="http://soap.sforce.com/2006/04/metadata"/>\n'
+const EMAIL_BODY_CONTENT = 'Hello\n'
+
+const FOLDER_MOVE_OLD_REPORT_FOLDER = `${FOLDER_MOVE_ROOT}/reports/OldFolder.reportFolder-meta.xml`
+const FOLDER_MOVE_OLD_REPORT_A = `${FOLDER_MOVE_ROOT}/reports/OldFolder/My_Report_A.report-meta.xml`
+const FOLDER_MOVE_OLD_REPORT_B = `${FOLDER_MOVE_ROOT}/reports/OldFolder/My_Report_B.report-meta.xml`
+const FOLDER_MOVE_OLD_REPORT_C = `${FOLDER_MOVE_ROOT}/reports/OldFolder/My_Report_C.report-meta.xml`
+const FOLDER_MOVE_NEW_REPORT_FOLDER = `${FOLDER_MOVE_ROOT}/reports/NewFolder.reportFolder-meta.xml`
+const FOLDER_MOVE_NEW_REPORT_A = `${FOLDER_MOVE_ROOT}/reports/NewFolder/My_Report_A.report-meta.xml`
+const FOLDER_MOVE_NEW_REPORT_B = `${FOLDER_MOVE_ROOT}/reports/NewFolder/My_Report_B.report-meta.xml`
+const FOLDER_MOVE_NEW_REPORT_C_RENAMED = `${FOLDER_MOVE_ROOT}/reports/NewFolder/My_Report_C_Renamed.report-meta.xml`
+
+const FOLDER_MOVE_OLD_DASH_FOLDER = `${FOLDER_MOVE_ROOT}/dashboards/OldDash.dashboardFolder-meta.xml`
+const FOLDER_MOVE_OLD_DASH = `${FOLDER_MOVE_ROOT}/dashboards/OldDash/My_Dash.dashboard-meta.xml`
+const FOLDER_MOVE_OLD_DASH2 = `${FOLDER_MOVE_ROOT}/dashboards/OldDash/My_Dash2.dashboard-meta.xml`
+const FOLDER_MOVE_NEW_DASH_FOLDER = `${FOLDER_MOVE_ROOT}/dashboards/NewDash.dashboardFolder-meta.xml`
+const FOLDER_MOVE_NEW_DASH = `${FOLDER_MOVE_ROOT}/dashboards/NewDash/My_Dash.dashboard-meta.xml`
+const FOLDER_MOVE_NEW_DASH2_RENAMED = `${FOLDER_MOVE_ROOT}/dashboards/NewDash/My_Dash2_Renamed.dashboard-meta.xml`
+
+const FOLDER_MOVE_OLD_DOC = `${FOLDER_MOVE_ROOT}/documents/OldDocFolder/My_Doc.document-meta.xml`
+const FOLDER_MOVE_NEW_DOC = `${FOLDER_MOVE_ROOT}/documents/NewDocFolder/My_Doc.document-meta.xml`
+
+const FOLDER_MOVE_OLD_EMAIL_BODY = `${FOLDER_MOVE_ROOT}/email/OldEmailFolder/My_Tpl.email`
+const FOLDER_MOVE_OLD_EMAIL_META = `${FOLDER_MOVE_ROOT}/email/OldEmailFolder/My_Tpl.email-meta.xml`
+const FOLDER_MOVE_NEW_EMAIL_BODY = `${FOLDER_MOVE_ROOT}/email/NewEmailFolder/My_Tpl.email`
+const FOLDER_MOVE_NEW_EMAIL_META = `${FOLDER_MOVE_ROOT}/email/NewEmailFolder/My_Tpl.email-meta.xml`
+
+const FOLDER_MOVE_FOO_FOLDER = `${FOLDER_MOVE_ROOT}/reports/Foo.reportFolder-meta.xml`
+const FOLDER_MOVE_FOO_REPORT = `${FOLDER_MOVE_ROOT}/reports/Foo/Foo.report-meta.xml`
+const FOLDER_MOVE_BAR_REPORT = `${FOLDER_MOVE_ROOT}/reports/Bar/Foo.report-meta.xml`
+const FOLDER_MOVE_BAR_FOLDER = `${FOLDER_MOVE_ROOT}/reports/Bar.reportFolder-meta.xml`
+
+/**
+ * Report/Dashboard folder moves, Document/EmailTemplate folder moves (in-folder
+ * types with no folder-descriptor pendant), and the shape where a report's
+ * DeveloperName equals its own folder's name — the layout that rejected the
+ * cancellation-key-rewrite design alternative. `moved` renames every path so
+ * `git diff -M` reports R100 throughout, keeping rename detection available
+ * whether or not sgd asks for it; `folderCollapse` instead deletes the old
+ * folder descriptor outright and only renames the report, so the descriptor
+ * deletion has no rename pair to hide behind.
+ */
+export const buildFolderMoveFixtureRepo = (
+  dir: string
+): FolderMoveFixtureRefs => {
+  initRepo(dir)
+
+  const root = makeCommit(dir, null, 'root', [
+    {
+      kind: 'add',
+      mode: '100644',
+      path: FOLDER_MOVE_OLD_REPORT_FOLDER,
+      content: REPORT_FOLDER_META_CONTENT,
+    },
+    {
+      kind: 'add',
+      mode: '100644',
+      path: FOLDER_MOVE_OLD_REPORT_A,
+      content: REPORT_META_CONTENT,
+    },
+    {
+      kind: 'add',
+      mode: '100644',
+      path: FOLDER_MOVE_OLD_REPORT_B,
+      content: REPORT_META_CONTENT,
+    },
+    {
+      kind: 'add',
+      mode: '100644',
+      path: FOLDER_MOVE_OLD_REPORT_C,
+      content: REPORT_META_CONTENT,
+    },
+    {
+      kind: 'add',
+      mode: '100644',
+      path: FOLDER_MOVE_FOO_FOLDER,
+      content: REPORT_FOLDER_META_CONTENT,
+    },
+    {
+      kind: 'add',
+      mode: '100644',
+      path: FOLDER_MOVE_FOO_REPORT,
+      content: REPORT_META_CONTENT,
+    },
+    {
+      kind: 'add',
+      mode: '100644',
+      path: FOLDER_MOVE_OLD_DASH_FOLDER,
+      content: DASHBOARD_FOLDER_META_CONTENT,
+    },
+    {
+      kind: 'add',
+      mode: '100644',
+      path: FOLDER_MOVE_OLD_DASH,
+      content: DASHBOARD_META_CONTENT,
+    },
+    {
+      kind: 'add',
+      mode: '100644',
+      path: FOLDER_MOVE_OLD_DASH2,
+      content: DASHBOARD_META_CONTENT,
+    },
+    {
+      kind: 'add',
+      mode: '100644',
+      path: FOLDER_MOVE_OLD_DOC,
+      content: DOCUMENT_META_CONTENT,
+    },
+    {
+      kind: 'add',
+      mode: '100644',
+      path: FOLDER_MOVE_OLD_EMAIL_BODY,
+      content: EMAIL_BODY_CONTENT,
+    },
+    {
+      kind: 'add',
+      mode: '100644',
+      path: FOLDER_MOVE_OLD_EMAIL_META,
+      content: EMAIL_TEMPLATE_META_CONTENT,
+    },
+  ])
+
+  const moved = makeCommit(dir, root, 'move report and dashboard folders', [
+    {
+      kind: 'rename',
+      from: FOLDER_MOVE_OLD_REPORT_FOLDER,
+      to: FOLDER_MOVE_NEW_REPORT_FOLDER,
+    },
+    {
+      kind: 'rename',
+      from: FOLDER_MOVE_OLD_REPORT_A,
+      to: FOLDER_MOVE_NEW_REPORT_A,
+    },
+    {
+      kind: 'rename',
+      from: FOLDER_MOVE_OLD_REPORT_B,
+      to: FOLDER_MOVE_NEW_REPORT_B,
+    },
+    {
+      kind: 'rename',
+      from: FOLDER_MOVE_OLD_REPORT_C,
+      to: FOLDER_MOVE_NEW_REPORT_C_RENAMED,
+    },
+    {
+      kind: 'rename',
+      from: FOLDER_MOVE_OLD_DASH_FOLDER,
+      to: FOLDER_MOVE_NEW_DASH_FOLDER,
+    },
+    { kind: 'rename', from: FOLDER_MOVE_OLD_DASH, to: FOLDER_MOVE_NEW_DASH },
+    {
+      kind: 'rename',
+      from: FOLDER_MOVE_OLD_DASH2,
+      to: FOLDER_MOVE_NEW_DASH2_RENAMED,
+    },
+    { kind: 'rename', from: FOLDER_MOVE_OLD_DOC, to: FOLDER_MOVE_NEW_DOC },
+    {
+      kind: 'rename',
+      from: FOLDER_MOVE_OLD_EMAIL_BODY,
+      to: FOLDER_MOVE_NEW_EMAIL_BODY,
+    },
+    {
+      kind: 'rename',
+      from: FOLDER_MOVE_OLD_EMAIL_META,
+      to: FOLDER_MOVE_NEW_EMAIL_META,
+    },
+  ])
+
+  // `moved` above left the index holding its own tree, not `root`'s — the
+  // index is a single persistent file across these plumbing-only commits,
+  // not reset per commit. Re-seed it from `root` so this sibling commit
+  // branches off `root` instead of continuing from `moved`.
+  runGit(['read-tree', root], { cwd: dir })
+
+  const folderCollapse = makeCommit(
+    dir,
+    root,
+    'collapse the folder-named report into its move destination',
+    [
+      { kind: 'delete', path: FOLDER_MOVE_FOO_FOLDER },
+      {
+        kind: 'rename',
+        from: FOLDER_MOVE_FOO_REPORT,
+        to: FOLDER_MOVE_BAR_REPORT,
+      },
+      {
+        kind: 'add',
+        mode: '100644',
+        path: FOLDER_MOVE_BAR_FOLDER,
+        content: REPORT_FOLDER_META_CONTENT,
+      },
+    ]
+  )
+
+  return { root, moved, folderCollapse }
+}
+
+export type RenameIgnoreFixtureRefs = {
+  // Adds Foo.cls (+ meta) and Baz.cls (+ meta) under the default classes directory.
+  root: string
+  // From `root`: renames Foo.cls (+ meta) to Bar.cls (+ meta), same directory.
+  classRename: string
+  // From `root`: renames Baz.cls (+ meta) to Qux.cls (+ meta) under a sibling
+  // archive directory — a move and a rename in the same commit.
+  archiveMove: string
+}
+
+export const RENAME_IGNORE_FOO_CLASS = `${SFDX_DEFAULT_ROOT}/classes/Foo.cls`
+export const RENAME_IGNORE_FOO_META = `${SFDX_DEFAULT_ROOT}/classes/Foo.cls-meta.xml`
+export const RENAME_IGNORE_BAR_CLASS = `${SFDX_DEFAULT_ROOT}/classes/Bar.cls`
+export const RENAME_IGNORE_BAR_META = `${SFDX_DEFAULT_ROOT}/classes/Bar.cls-meta.xml`
+export const RENAME_IGNORE_BAZ_CLASS = `${SFDX_DEFAULT_ROOT}/classes/Baz.cls`
+export const RENAME_IGNORE_BAZ_META = `${SFDX_DEFAULT_ROOT}/classes/Baz.cls-meta.xml`
+export const RENAME_IGNORE_ARCHIVE_ROOT = 'force-app/archive'
+export const RENAME_IGNORE_QUX_CLASS = `${RENAME_IGNORE_ARCHIVE_ROOT}/classes/Qux.cls`
+export const RENAME_IGNORE_QUX_META = `${RENAME_IGNORE_ARCHIVE_ROOT}/classes/Qux.cls-meta.xml`
+
+/**
+ * Two independent ApexClass pairs under the default source directory. Each
+ * class's `-meta.xml` content differs (`apiVersion` 60 vs 59), so every
+ * file's blob is unique within the fixture — the pairing-ambiguity trap the
+ * installed tsgit can fall into on byte-identical blobs never applies here.
+ * `classRename` renames Foo -> Bar in place; `archiveMove` renames Baz -> Qux
+ * into a sibling directory, so one sibling proves a same-directory rename
+ * and the other proves a move-and-rename.
+ */
+export const buildRenameIgnoreFixtureRepo = (
+  dir: string
+): RenameIgnoreFixtureRefs => {
+  initRepo(dir)
+
+  const root = makeCommit(dir, null, 'add class pair', [
+    {
+      kind: 'add',
+      mode: '100644',
+      path: RENAME_IGNORE_FOO_CLASS,
+      content: 'public class Foo {}\n',
+    },
+    {
+      kind: 'add',
+      mode: '100644',
+      path: RENAME_IGNORE_FOO_META,
+      content:
+        '<ApexClass xmlns="http://soap.sforce.com/2006/04/metadata"><apiVersion>60.0</apiVersion></ApexClass>\n',
+    },
+    {
+      kind: 'add',
+      mode: '100644',
+      path: RENAME_IGNORE_BAZ_CLASS,
+      content: 'public class Baz {}\n',
+    },
+    {
+      kind: 'add',
+      mode: '100644',
+      path: RENAME_IGNORE_BAZ_META,
+      content:
+        '<ApexClass xmlns="http://soap.sforce.com/2006/04/metadata"><apiVersion>59.0</apiVersion></ApexClass>\n',
+    },
+  ])
+
+  const classRename = makeCommit(dir, root, 'rename Foo to Bar', [
+    {
+      kind: 'rename',
+      from: RENAME_IGNORE_FOO_CLASS,
+      to: RENAME_IGNORE_BAR_CLASS,
+    },
+    {
+      kind: 'rename',
+      from: RENAME_IGNORE_FOO_META,
+      to: RENAME_IGNORE_BAR_META,
+    },
+  ])
+
+  // `classRename` above left the index holding its own tree, not `root`'s —
+  // the index is a single persistent file across these plumbing-only
+  // commits, not reset per commit. Re-seed it from `root` so this sibling
+  // commit branches off `root` instead of continuing from `classRename`.
+  runGit(['read-tree', root], { cwd: dir })
+
+  const archiveMove = makeCommit(
+    dir,
+    root,
+    'move and rename Baz to the archive as Qux',
+    [
+      {
+        kind: 'rename',
+        from: RENAME_IGNORE_BAZ_CLASS,
+        to: RENAME_IGNORE_QUX_CLASS,
+      },
+      {
+        kind: 'rename',
+        from: RENAME_IGNORE_BAZ_META,
+        to: RENAME_IGNORE_QUX_META,
+      },
+    ]
+  )
+
+  return { root, classRename, archiveMove }
+}
+
+export type UndeletableTypeFixtureRefs = {
+  // Adds the Anchor class, two CustomObjects and their Alpha/Delta record types.
+  root: string
+  // From `root`: deletes the Account.Alpha record type outright.
+  recordTypeDeleted: string
+  // From `root`: renames the Account.Alpha record type to Account.Beta.
+  recordTypeRenamed: string
+  // From `root`: deletes the Account object together with its Alpha record
+  // type — the deploy destroys the holder, so the record type needs no
+  // manual cleanup and must not be reported as orphaned.
+  holderDeleted: string
+  // From `root`: only the Anchor class is touched; every record type is
+  // untouched here — reached only through an include-destructive walk.
+  anchorTouched: string
+}
+
+export const UNDELETABLE_ANCHOR_CLASS = `${SFDX_DEFAULT_ROOT}/classes/Anchor.cls`
+export const UNDELETABLE_ANCHOR_META = `${SFDX_DEFAULT_ROOT}/classes/Anchor.cls-meta.xml`
+export const UNDELETABLE_ACCOUNT_OBJECT = `${SFDX_DEFAULT_ROOT}/objects/Account/Account.object-meta.xml`
+export const UNDELETABLE_ALPHA_RECORD_TYPE = `${SFDX_DEFAULT_ROOT}/objects/Account/recordTypes/Alpha.recordType-meta.xml`
+export const UNDELETABLE_BETA_RECORD_TYPE = `${SFDX_DEFAULT_ROOT}/objects/Account/recordTypes/Beta.recordType-meta.xml`
+export const UNDELETABLE_CONTACT_OBJECT = `${SFDX_DEFAULT_ROOT}/objects/Contact/Contact.object-meta.xml`
+export const UNDELETABLE_DELTA_RECORD_TYPE = `${SFDX_DEFAULT_ROOT}/objects/Contact/recordTypes/Delta.recordType-meta.xml`
+export const UNDELETABLE_CONTACT_RECORD_TYPES_GLOB = `${SFDX_DEFAULT_ROOT}/objects/Contact/recordTypes/**`
+
+/**
+ * An Anchor ApexClass plus two CustomObjects, each carrying one RecordType
+ * (Account/Alpha, Contact/Delta). `recordTypeDeleted` deletes Alpha outright;
+ * `recordTypeRenamed` renames Alpha to Beta (unique blob, so the exact pass
+ * pairs it deterministically); `anchorTouched` only modifies the Anchor
+ * class, leaving every record type reachable solely through an
+ * include-destructive walk; `holderDeleted` removes the Account object and
+ * Alpha together. Every blob in this fixture is distinct, so no sibling can
+ * present two same-type components sharing one blob — the shape that makes
+ * rename pairing arbitrary.
+ */
+export const buildUndeletableTypeFixtureRepo = (
+  dir: string
+): UndeletableTypeFixtureRefs => {
+  initRepo(dir)
+
+  const root = makeCommit(dir, null, 'add anchor class and record types', [
+    {
+      kind: 'add',
+      mode: '100644',
+      path: UNDELETABLE_ANCHOR_CLASS,
+      content: 'public class Anchor { }\n',
+    },
+    {
+      kind: 'add',
+      mode: '100644',
+      path: UNDELETABLE_ANCHOR_META,
+      content:
+        '<ApexClass xmlns="http://soap.sforce.com/2006/04/metadata"><apiVersion>60.0</apiVersion></ApexClass>\n',
+    },
+    {
+      kind: 'add',
+      mode: '100644',
+      path: UNDELETABLE_ACCOUNT_OBJECT,
+      content:
+        '<CustomObject xmlns="http://soap.sforce.com/2006/04/metadata"><label>Account</label></CustomObject>\n',
+    },
+    {
+      kind: 'add',
+      mode: '100644',
+      path: UNDELETABLE_ALPHA_RECORD_TYPE,
+      content:
+        '<RecordType xmlns="http://soap.sforce.com/2006/04/metadata"><fullName>Alpha</fullName></RecordType>\n',
+    },
+    {
+      kind: 'add',
+      mode: '100644',
+      path: UNDELETABLE_CONTACT_OBJECT,
+      content:
+        '<CustomObject xmlns="http://soap.sforce.com/2006/04/metadata"><label>Contact</label></CustomObject>\n',
+    },
+    {
+      kind: 'add',
+      mode: '100644',
+      path: UNDELETABLE_DELTA_RECORD_TYPE,
+      content:
+        '<RecordType xmlns="http://soap.sforce.com/2006/04/metadata"><fullName>Delta</fullName></RecordType>\n',
+    },
+  ])
+
+  const recordTypeDeleted = makeCommit(
+    dir,
+    root,
+    'delete the Alpha record type outright',
+    [{ kind: 'delete', path: UNDELETABLE_ALPHA_RECORD_TYPE }]
+  )
+
+  // `recordTypeDeleted` above left the index holding its own tree, not
+  // `root`'s — the index is a single persistent file across these
+  // plumbing-only commits, not reset per commit. Re-seed it from `root` so
+  // this sibling commit branches off `root` instead of continuing from
+  // `recordTypeDeleted`.
+  runGit(['read-tree', root], { cwd: dir })
+
+  const recordTypeRenamed = makeCommit(
+    dir,
+    root,
+    'rename the Alpha record type to Beta',
+    [
+      {
+        kind: 'rename',
+        from: UNDELETABLE_ALPHA_RECORD_TYPE,
+        to: UNDELETABLE_BETA_RECORD_TYPE,
+      },
+    ]
+  )
+
+  runGit(['read-tree', root], { cwd: dir })
+
+  const anchorTouched = makeCommit(dir, root, 'touch only the anchor class', [
+    {
+      kind: 'add',
+      mode: '100644',
+      path: UNDELETABLE_ANCHOR_CLASS,
+      content: 'public class Anchor { /* touched */ }\n',
+    },
+  ])
+
+  runGit(['read-tree', root], { cwd: dir })
+
+  const holderDeleted = makeCommit(
+    dir,
+    root,
+    'delete the Account object and its Alpha record type',
+    [
+      { kind: 'delete', path: UNDELETABLE_ACCOUNT_OBJECT },
+      { kind: 'delete', path: UNDELETABLE_ALPHA_RECORD_TYPE },
+    ]
+  )
+
+  runGit(['update-ref', 'HEAD', anchorTouched], { cwd: dir })
+
+  return {
+    root,
+    recordTypeDeleted,
+    recordTypeRenamed,
+    holderDeleted,
+    anchorTouched,
+  }
+}
+
+export type InFileDestructiveIgnoreFixtureRefs = {
+  // Adds a monolithic CustomLabels file holding the Keep and Gone labels, and
+  // a Workflow file no later commit touches.
+  root: string
+  // From `root`: rewrites that same file to hold Keep and Added — git reports
+  // one modification line, while Gone is deleted inside the file.
+  labelsModified: string
+}
+
+export const IN_FILE_IGNORE_LABELS = `${SFDX_DEFAULT_ROOT}/labels/CustomLabels.labels-meta.xml`
+export const IN_FILE_IGNORE_KEPT_LABEL = 'Keep'
+export const IN_FILE_IGNORE_DELETED_LABEL = 'Gone'
+export const IN_FILE_IGNORE_ADDED_LABEL = 'Added'
+export const IN_FILE_UNTOUCHED_WORKFLOW = `${SFDX_DEFAULT_ROOT}/workflows/Account.workflow-meta.xml`
+export const IN_FILE_UNTOUCHED_WORKFLOW_NAME = 'Account'
+export const IN_FILE_UNTOUCHED_WORKFLOW_ALERTS = ['Alpha', 'Beta']
+
+const customLabels = (names: string[]): string =>
+  [
+    '<?xml version="1.0" encoding="UTF-8"?>',
+    '<CustomLabels xmlns="http://soap.sforce.com/2006/04/metadata">',
+    ...names.map(name =>
+      [
+        '    <labels>',
+        `        <fullName>${name}</fullName>`,
+        '        <language>en_US</language>',
+        '        <protected>false</protected>',
+        `        <shortDescription>${name}</shortDescription>`,
+        `        <value>${name}</value>`,
+        '    </labels>',
+      ].join('\n')
+    ),
+    '</CustomLabels>',
+    '',
+  ].join('\n')
+
+export const buildInFileDestructiveIgnoreFixtureRepo = (
+  dir: string
+): InFileDestructiveIgnoreFixtureRefs => {
+  initRepo(dir)
+
+  const root = makeCommit(dir, null, 'add custom labels', [
+    {
+      kind: 'add',
+      mode: '100644',
+      path: IN_FILE_IGNORE_LABELS,
+      content: customLabels([
+        IN_FILE_IGNORE_DELETED_LABEL,
+        IN_FILE_IGNORE_KEPT_LABEL,
+      ]),
+    },
+    {
+      kind: 'add',
+      mode: '100644',
+      path: IN_FILE_UNTOUCHED_WORKFLOW,
+      content: workflowXml(IN_FILE_UNTOUCHED_WORKFLOW_ALERTS),
+    },
+  ])
+
+  const labelsModified = makeCommit(
+    dir,
+    root,
+    'delete the Gone label and add the Added label',
+    [
+      {
+        kind: 'add',
+        mode: '100644',
+        path: IN_FILE_IGNORE_LABELS,
+        content: customLabels([
+          IN_FILE_IGNORE_ADDED_LABEL,
+          IN_FILE_IGNORE_KEPT_LABEL,
+        ]),
+      },
+    ]
+  )
+
+  runGit(['update-ref', 'HEAD', labelsModified], { cwd: dir })
+
+  return { root, labelsModified }
+}
+
+const rootPath = (relative: string): string =>
+  `${SFDX_DEFAULT_ROOT}/${relative}`
+
+export const DECOMPOSED_REGISTRATIONS_DIR = rootPath(
+  'externalServiceRegistrations'
+)
+
+const SF_XMLNS = 'xmlns="http://soap.sforce.com/2006/04/metadata"'
+const XML_PROLOG = '<?xml version="1.0" encoding="UTF-8"?>'
+
+const xmlDocument = (lines: string[]): string =>
+  [XML_PROLOG, ...lines, ''].join('\n')
+
+const holderXml = (root: string): string =>
+  xmlDocument([`<${root} ${SF_XMLNS}></${root}>`])
+
+const workflowAlertXml = (description: string): string =>
+  xmlDocument([
+    `<WorkflowAlert ${SF_XMLNS}>`,
+    '    <fullName>MyAlert</fullName>',
+    `    <description>${description}</description>`,
+    '    <protected>false</protected>',
+    '    <senderType>CurrentUser</senderType>',
+    '    <template>unfiled$public/T</template>',
+    '</WorkflowAlert>',
+  ])
+
+const sharingOwnerRuleXml = (accessLevel: string): string =>
+  xmlDocument([
+    `<SharingOwnerRule ${SF_XMLNS}>`,
+    '    <fullName>MyOwner</fullName>',
+    `    <accessLevel>${accessLevel}</accessLevel>`,
+    '    <label>MyOwner</label>',
+    '    <sharedTo>',
+    '        <allInternalUsers></allInternalUsers>',
+    '    </sharedTo>',
+    '    <sharedFrom>',
+    '        <allInternalUsers></allInternalUsers>',
+    '    </sharedFrom>',
+    '</SharingOwnerRule>',
+  ])
+
+// Beta keeps the namespaced root SDR writes; Beta2 writes a bare root.
+const BETA_LABEL_TAG = `CustomLabel ${SF_XMLNS}`
+const BETA2_LABEL_TAG = 'CustomLabel'
+
+const labelXml = (openingTag: string, name: string, value: string): string =>
+  xmlDocument([
+    `<${openingTag}>`,
+    `    <fullName>${name}</fullName>`,
+    '    <language>en_US</language>',
+    '    <protected>false</protected>',
+    `    <shortDescription>${name}</shortDescription>`,
+    `    <value>${value}</value>`,
+    '</CustomLabel>',
+  ])
+
+const permissionSetXml = (label: string): string =>
+  xmlDocument([
+    `<PermissionSet ${SF_XMLNS}>`,
+    `    <label>${label}</label>`,
+    '    <hasActivationRequired>false</hasActivationRequired>',
+    `    <description>${label}</description>`,
+    '</PermissionSet>',
+  ])
+
+const userPermissionXml = (enabled: boolean): string =>
+  xmlDocument([
+    `<UserPermission ${SF_XMLNS}>`,
+    `    <enabled>${enabled}</enabled>`,
+    '    <name>ApiEnabled</name>',
+    '</UserPermission>',
+  ])
+
+const userPermissionsBeta2Xml = (enabled: boolean): string =>
+  xmlDocument([
+    '<PermissionSet>',
+    '    <userPermissions>',
+    `        <enabled>${enabled}</enabled>`,
+    '        <name>ApiEnabled</name>',
+    '    </userPermissions>',
+    '</PermissionSet>',
+  ])
+
+const registrationXml = (label: string, schemaLines: string[]): string =>
+  xmlDocument([
+    `<ExternalServiceRegistration ${SF_XMLNS}>`,
+    `    <label>${label}</label>`,
+    '    <namedCredential>NC</namedCredential>',
+    '    <registrationProviderType>Custom</registrationProviderType>',
+    ...schemaLines,
+    '    <status>Complete</status>',
+    '</ExternalServiceRegistration>',
+  ])
+
+const decomposedRegistrationXml = (label: string): string =>
+  registrationXml(label, [
+    '    <schemaType>OpenApi3</schemaType>',
+    '    <schemaUploadFileExtension>yaml</schemaUploadFileExtension>',
+  ])
+
+const monolithicRegistrationXml = (label: string, schema: string): string =>
+  registrationXml(label, [
+    `    <schema>${schema}</schema>`,
+    '    <schemaType>OpenApi3</schemaType>',
+  ])
+
+const registrationSchemaYaml = (title: string): string =>
+  [
+    'openapi: 3.0.0',
+    'info:',
+    `  title: ${title}`,
+    "  version: '1'",
+    'paths: {}',
+    '',
+  ].join('\n')
+
+const addFile = (path: string, content: string): FixtureOp => ({
+  kind: 'add',
+  mode: '100644',
+  path,
+  content,
+})
+
+const ALERT = rootPath(
+  'workflows/Account/workflowAlerts/MyAlert.workflowAlert-meta.xml'
+)
+const OWNER = rootPath(
+  'sharingRules/Account/sharingOwnerRules/MyOwner.sharingOwnerRule-meta.xml'
+)
+const LABEL_BETA = rootPath('labels/CustomLabels/LBeta.label-meta.xml')
+const LABEL_BETA2 = rootPath('labels/LBeta2.label-meta.xml')
+const PS_BETA_CHILD = rootPath(
+  'permissionsets/PSBeta/userPermissions/ApiEnabled.userPermission-meta.xml'
+)
+const PS_BETA2_CHILD = rootPath(
+  'permissionsets/PSBeta2/PSBeta2.userPermission-meta.xml'
+)
+const registrationDefinition = (name: string): string =>
+  `${DECOMPOSED_REGISTRATIONS_DIR}/${name}.externalServiceRegistration-meta.xml`
+const registrationSchema = (name: string): string =>
+  `${DECOMPOSED_REGISTRATIONS_DIR}/${name}.yaml`
+
+const DECOMPOSED_ROOT_OPS: FixtureOp[] = [
+  addFile(
+    rootPath('workflows/Account/Account.workflow-meta.xml'),
+    holderXml('Workflow')
+  ),
+  addFile(ALERT, workflowAlertXml('a')),
+  addFile(
+    rootPath('sharingRules/Account/Account.sharingRules-meta.xml'),
+    holderXml('SharingRules')
+  ),
+  addFile(OWNER, sharingOwnerRuleXml('Read')),
+  addFile(
+    rootPath('labels/CustomLabels/CustomLabels.labels-meta.xml'),
+    holderXml('CustomLabels')
+  ),
+  addFile(LABEL_BETA, labelXml(BETA_LABEL_TAG, 'LBeta', 'one')),
+  addFile(LABEL_BETA2, labelXml(BETA2_LABEL_TAG, 'LBeta2', 'two')),
+  addFile(
+    rootPath('permissionsets/PSBeta/PSBeta.permissionset-meta.xml'),
+    permissionSetXml('PSBeta')
+  ),
+  addFile(PS_BETA_CHILD, userPermissionXml(true)),
+  addFile(
+    rootPath('permissionsets/PSBeta2/PSBeta2.permissionset-meta.xml'),
+    permissionSetXml('PSBeta2')
+  ),
+  addFile(PS_BETA2_CHILD, userPermissionsBeta2Xml(true)),
+  ...['SvcLive', 'SvcGone', 'SvcRen', 'SvcLeave'].flatMap(name => [
+    addFile(registrationDefinition(name), decomposedRegistrationXml(name)),
+    addFile(registrationSchema(name), registrationSchemaYaml(name)),
+  ]),
+  addFile(
+    registrationDefinition('SvcMono'),
+    monolithicRegistrationXml('SvcMono', 'openapi: 3.0.0')
+  ),
+  addFile(registrationSchema('Orphan'), registrationSchemaYaml('Orphan')),
+]
+
+const DECOMPOSED_SCENARIOS = {
+  workflowAlertModified: [
+    'edit the workflow alert',
+    [addFile(ALERT, workflowAlertXml('b'))],
+  ],
+  workflowAlertDeleted: [
+    'delete the workflow alert',
+    [{ kind: 'delete', path: ALERT }],
+  ],
+  sharingOwnerRuleModified: [
+    'edit the sharing owner rule',
+    [addFile(OWNER, sharingOwnerRuleXml('Edit'))],
+  ],
+  sharingOwnerRuleDeleted: [
+    'delete the sharing owner rule',
+    [{ kind: 'delete', path: OWNER }],
+  ],
+  labelBetaModified: [
+    'edit the beta label',
+    [addFile(LABEL_BETA, labelXml(BETA_LABEL_TAG, 'LBeta', 'uno'))],
+  ],
+  labelBetaDeleted: [
+    'delete the beta label',
+    [{ kind: 'delete', path: LABEL_BETA }],
+  ],
+  labelBeta2Modified: [
+    'edit the beta2 label',
+    [addFile(LABEL_BETA2, labelXml(BETA2_LABEL_TAG, 'LBeta2', 'dos'))],
+  ],
+  labelBeta2Deleted: [
+    'delete the beta2 label',
+    [{ kind: 'delete', path: LABEL_BETA2 }],
+  ],
+  permissionSetBetaChildModified: [
+    'edit the beta permission child',
+    [addFile(PS_BETA_CHILD, userPermissionXml(false))],
+  ],
+  permissionSetBetaChildDeleted: [
+    'delete the beta permission child',
+    [{ kind: 'delete', path: PS_BETA_CHILD }],
+  ],
+  permissionSetBeta2ChildModified: [
+    'edit the beta2 permission child',
+    [addFile(PS_BETA2_CHILD, userPermissionsBeta2Xml(false))],
+  ],
+  permissionSetBeta2ChildDeleted: [
+    'delete the beta2 permission child',
+    [{ kind: 'delete', path: PS_BETA2_CHILD }],
+  ],
+  registrationSchemaModified: [
+    'edit the SvcLive schema',
+    [
+      addFile(
+        registrationSchema('SvcLive'),
+        registrationSchemaYaml('SvcLive v2')
+      ),
+    ],
+  ],
+  registrationDefinitionModified: [
+    'edit the SvcLive definition',
+    [
+      addFile(
+        registrationDefinition('SvcLive'),
+        decomposedRegistrationXml('SvcLive v2')
+      ),
+    ],
+  ],
+  registrationSchemaRenamed: [
+    'rename the SvcRen schema',
+    [
+      {
+        kind: 'rename',
+        from: registrationSchema('SvcRen'),
+        to: registrationSchema('SvcRen2'),
+      },
+    ],
+  ],
+  registrationSchemaDeleted: [
+    'delete the SvcLive schema',
+    [{ kind: 'delete', path: registrationSchema('SvcLive') }],
+  ],
+  registrationRemoved: [
+    'delete the SvcGone definition and schema',
+    [
+      { kind: 'delete', path: registrationDefinition('SvcGone') },
+      { kind: 'delete', path: registrationSchema('SvcGone') },
+    ],
+  ],
+  registrationLeavingPreset: [
+    'inline the SvcLeave schema and delete its schema file',
+    [
+      addFile(
+        registrationDefinition('SvcLeave'),
+        monolithicRegistrationXml('SvcLeave', 'openapi: 3.0.0')
+      ),
+      { kind: 'delete', path: registrationSchema('SvcLeave') },
+    ],
+  ],
+  orphanSchemaDeleted: [
+    'delete the schema that has no definition',
+    [{ kind: 'delete', path: registrationSchema('Orphan') }],
+  ],
+  monolithicRegistrationModified: [
+    'edit the SvcMono label',
+    [
+      addFile(
+        registrationDefinition('SvcMono'),
+        monolithicRegistrationXml('SvcMono v2', 'openapi: 3.0.0')
+      ),
+    ],
+  ],
+} satisfies Record<string, readonly [string, FixtureOp[]]>
+
+type DecomposedScenario = keyof typeof DECOMPOSED_SCENARIOS
+
+type FixtureRange = { readonly from: string; readonly to: string }
+
+export type DecomposedSourceFormatsFixtureRefs = Readonly<
+  Record<DecomposedScenario, FixtureRange>
+>
+
+type ScenarioChain = {
+  readonly refs: Partial<Record<DecomposedScenario, FixtureRange>>
+  readonly parent: string
+}
+
+export const buildDecomposedSourceFormatsFixtureRepo = (
+  dir: string
+): DecomposedSourceFormatsFixtureRefs => {
+  initRepo(dir)
+  const root = makeCommit(
+    dir,
+    null,
+    'add every decomposed layout',
+    DECOMPOSED_ROOT_OPS
+  )
+  const chain = Object.entries(DECOMPOSED_SCENARIOS).reduce<ScenarioChain>(
+    ({ refs, parent }, [scenario, [message, ops]]) => {
+      const to = makeCommit(dir, parent, message, ops)
+      return { refs: { ...refs, [scenario]: { from: parent, to } }, parent: to }
+    },
+    { refs: {}, parent: root }
+  )
+  runGit(['update-ref', 'HEAD', chain.parent], { cwd: dir })
+  // Keys come from DECOMPOSED_SCENARIOS itself, so the folded record is complete.
+  return chain.refs as DecomposedSourceFormatsFixtureRefs
+}
+
+const UNPROCESSABLE_CLASS_A = rootPath('classes/A.cls')
+const UNPROCESSABLE_CLASS_A_META = rootPath('classes/A.cls-meta.xml')
+const UNPROCESSABLE_CLASS_A_LOWERCASED = rootPath('classes/a.cls')
+const UNPROCESSABLE_NOTES = rootPath('classes/notes.txt')
+const UNPROCESSABLE_NOTES_RENAMED = rootPath('classes/notes2.txt')
+const UNPROCESSABLE_README = rootPath('classes/readme.txt')
+const UNPROCESSABLE_README_AS_CLASS = rootPath('classes/Foo.cls')
+const UNPROCESSABLE_CLASS_BAR = rootPath('classes/Bar.cls')
+const UNPROCESSABLE_CLASS_BAR_META = rootPath('classes/Bar.cls-meta.xml')
+const UNPROCESSABLE_CLASS_BAR_AS_TEXT = rootPath('classes/bar.txt')
+const UNPROCESSABLE_LABELS = rootPath('labels/CustomLabels.labels-meta.xml')
+const UNPROCESSABLE_LABELS_RENAMED = rootPath('labels/Other.labels-meta.xml')
+const UNPROCESSABLE_LABELS_NOTES = rootPath('labels/notes.txt')
+const UNPROCESSABLE_LABELS_NOTES_RENAMED = rootPath('labels/notes2.txt')
+const UNPROCESSABLE_WORKFLOW = rootPath('workflows/Account.workflow-meta.xml')
+const UNPROCESSABLE_WORKFLOW_RENAMED = rootPath(
+  'workflows/Contact.workflow-meta.xml'
+)
+
+const apexClassMeta = (apiVersion: string): string =>
+  '<ApexClass xmlns="http://soap.sforce.com/2006/04/metadata"><apiVersion>' +
+  apiVersion +
+  '</apiVersion></ApexClass>\n'
+
+// Every blob is unique: tsgit pairs byte-identical blobs ambiguously.
+const UNPROCESSABLE_ROOT_OPS: FixtureOp[] = [
+  addFile(UNPROCESSABLE_CLASS_A, 'public class A {}\n'),
+  addFile(UNPROCESSABLE_CLASS_A_META, apexClassMeta('60.0')),
+  addFile(UNPROCESSABLE_NOTES, 'class folder notes\n'),
+  addFile(UNPROCESSABLE_README, 'class folder readme\n'),
+  addFile(UNPROCESSABLE_CLASS_BAR, 'public class Bar {}\n'),
+  addFile(UNPROCESSABLE_CLASS_BAR_META, apexClassMeta('59.0')),
+  addFile(UNPROCESSABLE_LABELS, customLabels(['L1'])),
+  addFile(UNPROCESSABLE_LABELS_NOTES, 'labels folder notes\n'),
+  addFile(UNPROCESSABLE_WORKFLOW, workflowXml(['Notify'])),
+]
+
+// Each entry is one sibling commit of `root` renaming exactly one file:
+// [commit message, renamed from, renamed to].
+const UNPROCESSABLE_SCENARIOS = {
+  txtRenamed: [
+    'rename the class folder notes',
+    UNPROCESSABLE_NOTES,
+    UNPROCESSABLE_NOTES_RENAMED,
+  ],
+  txtToClass: [
+    'rename a text file into a class',
+    UNPROCESSABLE_README,
+    UNPROCESSABLE_README_AS_CLASS,
+  ],
+  // Bar's meta stays behind.
+  classToTxt: [
+    'rename a class into a text file',
+    UNPROCESSABLE_CLASS_BAR,
+    UNPROCESSABLE_CLASS_BAR_AS_TEXT,
+  ],
+  labelsTxtRenamed: [
+    'rename the labels notes',
+    UNPROCESSABLE_LABELS_NOTES,
+    UNPROCESSABLE_LABELS_NOTES_RENAMED,
+  ],
+  labelsFileRenamed: [
+    'rename the labels file',
+    UNPROCESSABLE_LABELS,
+    UNPROCESSABLE_LABELS_RENAMED,
+  ],
+  // A's meta stays behind.
+  classCaseRenamed: [
+    'rename a class by case only',
+    UNPROCESSABLE_CLASS_A,
+    UNPROCESSABLE_CLASS_A_LOWERCASED,
+  ],
+  workflowRenamed: [
+    'rename the workflow container',
+    UNPROCESSABLE_WORKFLOW,
+    UNPROCESSABLE_WORKFLOW_RENAMED,
+  ],
+} as const satisfies Record<string, readonly [string, string, string]>
+
+type RenameUnprocessableScenario = keyof typeof UNPROCESSABLE_SCENARIOS
+
+export type RenameUnprocessableFixtureRefs = Readonly<
+  { root: string } & Record<RenameUnprocessableScenario, string>
+>
+
+// Each scenario is a sibling of `root`: the index persists across these
+// plumbing-only commits, so it is re-seeded from `root` first.
+const renameOffRoot = (
+  dir: string,
+  root: string,
+  message: string,
+  rename: RenameFile
+): string => {
+  runGit(['read-tree', root], { cwd: dir })
+  return makeCommit(dir, root, message, [rename])
+}
+
+export const buildRenameUnprocessableFixtureRepo = (
+  dir: string
+): RenameUnprocessableFixtureRefs => {
+  initRepo(dir)
+  const root = makeCommit(
+    dir,
+    null,
+    'add classes, labels, a workflow and stray files',
+    UNPROCESSABLE_ROOT_OPS
+  )
+  const scenarios = Object.entries(UNPROCESSABLE_SCENARIOS).map(
+    ([scenario, [message, from, to]]) => [
+      scenario,
+      renameOffRoot(dir, root, message, { kind: 'rename', from, to }),
+    ]
+  )
+  // Keys come from UNPROCESSABLE_SCENARIOS itself, so the record is complete.
+  return {
+    root,
+    ...Object.fromEntries(scenarios),
+  } as RenameUnprocessableFixtureRefs
+}
+
+export const LFS_PS_DIR = `${SFDX_DEFAULT_ROOT}/permissionsets/MyPS`
+const LFS_PS_META_PATH = `${LFS_PS_DIR}/MyPS.permissionset-meta.xml`
+const LFS_SFDX_PROJECT_PATH = 'sfdx-project.json'
+const LFS_SFDX_PROJECT_CONTENT =
+  '{"packageDirectories":[{"path":"force-app","default":true}],"sourceApiVersion":"62.0"}'
+const LFS_PS_META_CONTENT =
+  '<?xml version="1.0" encoding="UTF-8"?>\n<PermissionSet xmlns="http://soap.sforce.com/2006/04/metadata"><label>MyPS</label></PermissionSet>\n'
+const LFS_POINTER_PREFIX = 'version https://git-lfs.github.com/spec/v1\n'
+const LFS_OID_DIR_LENGTH = 2
+const LFS_CHANGED_CHILD = 1
+
+export const lfsObjectSettingsPath = (i: number): string =>
+  `${LFS_PS_DIR}/objectSettings/Obj${i}.objectSettings-meta.xml`
+
+const lfsObjectSettingsContent = (object: string): string =>
+  `<?xml version="1.0" encoding="UTF-8"?>\n<ObjectSettings xmlns="http://soap.sforce.com/2006/04/metadata"><object>${object}</object></ObjectSettings>\n`
+
+const lfsHash = (real: string): string =>
+  createHash('sha256').update(real).digest('hex')
+
+const lfsObjectPath = (dir: string, real: string): string => {
+  const hex = lfsHash(real)
+  return join(
+    dir,
+    '.git',
+    'lfs',
+    'objects',
+    hex.slice(0, LFS_OID_DIR_LENGTH),
+    hex.slice(LFS_OID_DIR_LENGTH, 2 * LFS_OID_DIR_LENGTH),
+    hex
+  )
+}
+
+const lfsPointerFor = (real: string): string =>
+  `${LFS_POINTER_PREFIX}oid sha256:${lfsHash(real)}\nsize ${Buffer.byteLength(real)}\n`
+
+const storeLfsObject = (dir: string, real: string): void => {
+  const objectPath = lfsObjectPath(dir, real)
+  mkdirSync(dirname(objectPath), { recursive: true })
+  writeFileSync(objectPath, real)
+}
+
+export const removeLfsObject = (dir: string, content: string): void => {
+  const objectPath = lfsObjectPath(dir, content)
+  if (!existsSync(objectPath)) {
+    throw new Error(`expected an lfs object at ${objectPath}`)
+  }
+  unlinkSync(objectPath)
+}
+
+export type LfsDirCopyFixtureRefs = {
+  readonly base: string
+  readonly head: string
+  // Every path at head, mapped to its resolved (real) bytes.
+  readonly contents: ReadonlyMap<string, string>
+}
+
+const psFileOps = (
+  dir: string,
+  files: ReadonlyMap<string, string>,
+  lfs: boolean
+): FixtureOp[] =>
+  [...files].map(([path, real]) => {
+    if (!lfs) return { kind: 'add', mode: '100644', path, content: real }
+    storeLfsObject(dir, real)
+    return { kind: 'add', mode: '100644', path, content: lfsPointerFor(real) }
+  })
+
+const lfsPsFiles = (
+  childCount: number,
+  changedChild: number | null
+): Map<string, string> => {
+  const files = new Map([[LFS_PS_META_PATH, LFS_PS_META_CONTENT]])
+  for (let i = 1; i <= childCount; i++) {
+    const object = i === changedChild ? `Obj${i}b__c` : `Obj${i}__c`
+    files.set(lfsObjectSettingsPath(i), lfsObjectSettingsContent(object))
+  }
+  return files
+}
+
+/**
+ * A decomposed permission set dir of `childCount` children plus its meta
+ * file, committed as LFS pointers (real bytes in .git/lfs/objects, no git-lfs
+ * binary needed) or, with `lfs: false`, as plain blobs. Head changes child 1.
+ */
+export const buildLfsDirCopyFixtureRepo = (
+  dir: string,
+  childCount: number,
+  options: { lfs?: boolean } = {}
+): LfsDirCopyFixtureRefs => {
+  const lfs = options.lfs ?? true
+  initRepo(dir)
+  const baseFiles = lfsPsFiles(childCount, null)
+  const headFiles = lfsPsFiles(childCount, LFS_CHANGED_CHILD)
+  const base = makeCommit(dir, null, 'base', [
+    {
+      kind: 'add',
+      mode: '100644',
+      path: LFS_SFDX_PROJECT_PATH,
+      content: LFS_SFDX_PROJECT_CONTENT,
+    },
+    ...psFileOps(dir, baseFiles, lfs),
+  ])
+  const head = makeCommit(dir, base, 'head', psFileOps(dir, headFiles, lfs))
+  runGit(['update-ref', 'HEAD', head], { cwd: dir })
+  return { base, head, contents: headFiles }
+}

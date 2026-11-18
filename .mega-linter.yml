@@ -9,10 +9,21 @@ APPLY_FIXES: all # all, none, or list of linter keys
 # - COPYPASTE # Uncomment to disable checks of excessive copy-pastes
 # - SPELL # Uncomment to disable checks of spelling mistakes
 DISABLE_LINTERS:
-  - SPELL_MISSPELL
-  - TYPESCRIPT_STANDARD
-  - TYPESCRIPT_PRETTIER
+  - ACTION_ZIZMOR
+  - JSON_V8R
   - MARKDOWN_MARKDOWN_LINK_CHECK
+  - SPELL_MISSPELL
+  - TYPESCRIPT_PRETTIER
+  - TYPESCRIPT_STANDARD
+MARKDOWN_MARKDOWNLINT_FILTER_REGEX_EXCLUDE: "messages/"
+# Empty-document fixtures intentionally exercise the empty-from
+# code paths in MetadataDiff and the streaming reader. xmllint flags
+# them as malformed which is correct — that's the point of the fixture.
+XML_XMLLINT_FILTER_REGEX_EXCLUDE: "byteEquality/fixtures/profile-(addition|from-empty)/from\\.xml"
+# tsconfig files are JSONC by TypeScript's own spec — comments are valid there and
+# these carry the reason each compiler option is present. jsonlint enforces strict
+# JSON and rejects them; prettier, biome and tsc all read them fine.
+JSON_JSONLINT_FILTER_REGEX_EXCLUDE: "tsconfig\\.json$"
 SHOW_ELAPSED_TIME: true
 FILEIO_REPORTER: false
 # DISABLE_ERRORS: true # Uncomment if you want MegaLinter to detect errors but not block CI to pass

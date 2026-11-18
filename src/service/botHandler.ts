@@ -1,44 +1,40 @@
 'use strict'
 import { parse } from 'node:path/posix'
-
 import { DOT, PATH_SEP } from '../constant/fsConstants.js'
-import { log } from '../utils/LoggingDecorator.js'
-import { fillPackageWithParameter } from '../utils/packageHelper.js'
+import { BOT_TYPE } from '../constant/metadataConstants.js'
+import type { HandlerResult } from '../types/handlerResult.js'
+import { ManifestTarget } from '../types/handlerResult.js'
 import ShareFolderHandler from './sharedFolderHandler.js'
 
-const BOT_TYPE = 'Bot'
 const BOT_EXTENSION = 'bot'
 
 export default class BotHandler extends ShareFolderHandler {
   protected override _getElementName() {
-    const parsedPath = this._getParsedPath()
-    const elementName = new Set([
-      parsedPath.dir.split(PATH_SEP).pop(),
-      parsedPath.name,
-    ])
+    const fileName = parse(this.element.basePath).name
+    const elementName = new Set([this.element.parentFolder, fileName])
     return [...elementName].join(DOT)
   }
 
-  @log
-  public override async handleAddition() {
-    await super.handleAddition()
-    await this._addParentBot()
-  }
-
-  protected async _addParentBot() {
-    const botName = this.parentFolder.split(PATH_SEP).pop() as string
-    fillPackageWithParameter({
-      store: this.diffs.package,
-      type: BOT_TYPE,
-      member: botName,
-    })
-
-    if (!this.config.generateDelta) return
-
+  public override async collectAddition(): Promise<HandlerResult> {
+    const result = await super.collectAddition()
+    const botName = this.element.parentFolder.split(PATH_SEP).pop() as string
+    const copies = [...result.copies]
     const botPath = `${
-      parse(this.line).dir
+      parse(this.element.basePath).dir
     }${PATH_SEP}${botName}.${BOT_EXTENSION}`
-
-    await this._copyWithMetaFile(botPath)
+    this._collectCopyWithMetaFile(copies, botPath)
+    return {
+      ...result,
+      elements: [
+        ...result.elements,
+        {
+          target: ManifestTarget.Package,
+          type: BOT_TYPE,
+          member: botName,
+          changeKind: this._getChangeKind(),
+        },
+      ],
+      copies,
+    }
   }
 }

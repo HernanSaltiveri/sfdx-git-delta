@@ -1,211 +1,483 @@
 'use strict'
-import { describe, expect, it, jest } from '@jest/globals'
+import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { MetadataRepository } from '../../../../src/metadata/MetadataRepository'
+import { getDefinition } from '../../../../src/metadata/metadataManager'
 import ContainedDecomposedHandler from '../../../../src/service/containedDecomposedHandler'
-import type { Work } from '../../../../src/types/work'
-import { copyFiles, readDirs } from '../../../../src/utils/fsHelper'
-import { getGlobalMetadata, getWork } from '../../../__utils__/globalTestHelper'
+import type { Config } from '../../../../src/types/config'
+import {
+  CopyOperationKind,
+  ManifestTarget,
+} from '../../../../src/types/handlerResult'
+import { readDirs } from '../../../../src/utils/fsHelper'
+import { elementsOf } from '../../../__utils__/handlerResultView'
+import { createElement } from '../../../__utils__/testElement'
+import { getConfig, getContext } from '../../../__utils__/testWork'
 
-jest.mock('../../../../src/utils/fsHelper')
+vi.mock('../../../../src/utils/fsHelper')
 
-const mockedReadDirs = jest.mocked(readDirs)
+const mockedReadDirs = vi.mocked(readDirs)
 
 let globalMetadata: MetadataRepository
 beforeAll(async () => {
-  globalMetadata = await getGlobalMetadata()
+  globalMetadata = await getDefinition({})
 })
 
-let work: Work
+let config: Config
 beforeEach(() => {
-  jest.clearAllMocks()
-  work = getWork()
-  work.config.generateDelta = true
+  vi.clearAllMocks()
+  config = getConfig()
+  config.generateDelta = true
 })
 
 describe('ContainedDecomposedHandler', () => {
-  describe('when generateDelta is false', () => {
-    it('addition does not copy files', async () => {
+  describe('collect', () => {
+    it('Given non-decomposed addition with generateDelta false, When collect, Then returns manifest with copies', async () => {
       // Arrange
-      work.config.generateDelta = false
-      const sut = new ContainedDecomposedHandler(
+      config.generateDelta = false
+      const { changeType, element } = createElement(
         `A       force-app/main/permissionsets/Subject.permissionset-meta.xml`,
         globalMetadata.get('permissionsets')!,
-        work,
         globalMetadata
       )
-      // Act
-      await sut.handle()
-
-      // Assert
-      expect(work.diffs.package.get('PermissionSet')).toContain('Subject')
-      expect(work.diffs.destructiveChanges.has('PermissionSet')).toBe(false)
-      expect(copyFiles).not.toHaveBeenCalled()
-    })
-  })
-
-  describe.each([
-    'permissionsets',
-    'other',
-    'permissionsets/subFolder',
-  ])('when it is not decomposed', folder => {
-    let line: string
-    beforeEach(() => {
-      line = `force-app/main/${folder}/Subject.permissionset-meta.xml`
-    })
-
-    it('should add addition to the package.xml', async () => {
-      // Arrange
       const sut = new ContainedDecomposedHandler(
-        `A       ${line}`,
-        globalMetadata.get('permissionsets')!,
-        work,
-        globalMetadata
+        changeType,
+        element,
+        getContext({ config })
       )
+
       // Act
-      await sut.handle()
+      const result = await sut.collect()
 
       // Assert
-      expect(work.diffs.package.get('PermissionSet')).toContain('Subject')
-      expect(work.diffs.destructiveChanges.has('PermissionSet')).toBe(false)
-      expect(copyFiles).toHaveBeenCalledTimes(1)
+      expect(elementsOf(result)).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            target: ManifestTarget.Package,
+            type: 'PermissionSet',
+            member: 'Subject',
+          }),
+        ])
+      )
+      expect(result.copies).toHaveLength(0)
     })
 
-    it('should add modification to the package.xml', async () => {
-      // Arrange
-      const sut = new ContainedDecomposedHandler(
-        `M       ${line}`,
-        globalMetadata.get('permissionsets')!,
-        work,
-        globalMetadata
-      )
-      // Act
-      await sut.handle()
+    describe.each(['permissionsets', 'other', 'permissionsets/subFolder'])(
+      'Given non-decomposed format in folder %s',
+      folder => {
+        it('When addition, Then returns Package manifest with file copy', async () => {
+          // Arrange
+          const line = `force-app/main/${folder}/Subject.permissionset-meta.xml`
+          const { changeType, element } = createElement(
+            `A       ${line}`,
+            globalMetadata.get('permissionsets')!,
+            globalMetadata
+          )
+          const sut = new ContainedDecomposedHandler(
+            changeType,
+            element,
+            getContext({ config })
+          )
 
-      // Assert
-      expect(work.diffs.package.get('PermissionSet')).toContain('Subject')
-      expect(work.diffs.destructiveChanges.has('PermissionSet')).toBe(false)
-      expect(copyFiles).toHaveBeenCalledTimes(1)
+          // Act
+          const result = await sut.collect()
+
+          // Assert
+          expect(elementsOf(result)).toEqual(
+            expect.arrayContaining([
+              expect.objectContaining({
+                target: ManifestTarget.Package,
+                type: 'PermissionSet',
+                member: 'Subject',
+              }),
+            ])
+          )
+          expect(result.copies.length).toBeGreaterThan(0)
+        })
+
+        it('When modification, Then returns Package manifest with file copy', async () => {
+          // Arrange
+          const line = `force-app/main/${folder}/Subject.permissionset-meta.xml`
+          const { changeType, element } = createElement(
+            `M       ${line}`,
+            globalMetadata.get('permissionsets')!,
+            globalMetadata
+          )
+          const sut = new ContainedDecomposedHandler(
+            changeType,
+            element,
+            getContext({ config })
+          )
+
+          // Act
+          const result = await sut.collect()
+
+          // Assert
+          expect(elementsOf(result)).toEqual(
+            expect.arrayContaining([
+              expect.objectContaining({
+                target: ManifestTarget.Package,
+                type: 'PermissionSet',
+                member: 'Subject',
+              }),
+            ])
+          )
+          expect(result.copies.length).toBeGreaterThan(0)
+        })
+
+        it('When deletion, Then returns DestructiveChanges manifest without copies', async () => {
+          // Arrange
+          const line = `force-app/main/${folder}/Subject.permissionset-meta.xml`
+          const { changeType, element } = createElement(
+            `D       ${line}`,
+            globalMetadata.get('permissionsets')!,
+            globalMetadata
+          )
+          const sut = new ContainedDecomposedHandler(
+            changeType,
+            element,
+            getContext({ config })
+          )
+
+          // Act
+          const result = await sut.collect()
+
+          // Assert
+          expect(elementsOf(result)).toEqual(
+            expect.arrayContaining([
+              expect.objectContaining({
+                target: ManifestTarget.DestructiveChanges,
+                type: 'PermissionSet',
+                member: 'Subject',
+              }),
+            ])
+          )
+          expect(result.copies).toHaveLength(0)
+        })
+      }
+    )
+
+    describe.each([
+      'force-app/main/default/permissionsets/Admin/objectSettings/Account.objectSettings-meta.xml',
+      'force-app/main/default/permissionsets/Admin/Admin.flowAccesses-meta.xml',
+      'force-app/main/default/permissionsets/Admin/fieldPermissions/Account.Test__c.fieldPermission-meta.xml',
+      'force-app/main/default/permissionsets/Admin/classAccesses/MyClass.classAccess-meta.xml',
+      'force-app/main/default/permissionsets/marketing/Admin/objectSettings/Account.objectSettings-meta.xml',
+      'force-app/main/default/permissionsets/marketing/Admin/Admin.flowAccesses-meta.xml',
+      'force-app/main/default/permissionsets/marketing/Admin/fieldPermissions/Account.Test__c.fieldPermission-meta.xml',
+      'force-app/main/default/permissionsets/marketing/Admin/classAccesses/MyClass.classAccess-meta.xml',
+    ])('Given decomposed format for %s', decomposedLine => {
+      it('When addition, Then returns Package manifest with holder folder copies', async () => {
+        // Arrange
+        const existingFiles = [
+          'force-app/main/default/permissionsets/Admin/Admin.permissionset-meta.xml',
+          'force-app/main/default/permissionsets/Admin/objectSettings/Account.objectSettings-meta.xml',
+          'force-app/main/default/permissionsets/Admin/fieldPermissions/Account.Name.fieldPermissions-meta.xml',
+        ]
+        mockedReadDirs.mockResolvedValue(existingFiles)
+
+        const { changeType, element } = createElement(
+          `A       ${decomposedLine}`,
+          globalMetadata.get('permissionsets')!,
+          globalMetadata
+        )
+        const sut = new ContainedDecomposedHandler(
+          changeType,
+          element,
+          getContext({ config })
+        )
+
+        // Act
+        const result = await sut.collect()
+
+        // Assert
+        expect(elementsOf(result)).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              target: ManifestTarget.Package,
+              type: 'PermissionSet',
+              member: 'Admin',
+            }),
+          ])
+        )
+        expect(result.copies.length).toBeGreaterThan(0)
+      })
+
+      it('When modification, Then returns Package manifest with holder folder copies', async () => {
+        // Arrange
+        const existingFiles = [
+          'force-app/main/default/permissionsets/Admin/Admin.permissionset-meta.xml',
+          'force-app/main/default/permissionsets/Admin/objectSettings/Account.objectSettings-meta.xml',
+          'force-app/main/default/permissionsets/Admin/fieldPermissions/Account.Name.fieldPermissions-meta.xml',
+        ]
+        mockedReadDirs.mockResolvedValue(existingFiles)
+
+        const { changeType, element } = createElement(
+          `M       ${decomposedLine}`,
+          globalMetadata.get('permissionsets')!,
+          globalMetadata
+        )
+        const sut = new ContainedDecomposedHandler(
+          changeType,
+          element,
+          getContext({ config })
+        )
+
+        // Act
+        const result = await sut.collect()
+
+        // Assert
+        expect(elementsOf(result)).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              target: ManifestTarget.Package,
+              type: 'PermissionSet',
+              member: 'Admin',
+            }),
+          ])
+        )
+        expect(result.copies.length).toBeGreaterThan(0)
+      })
+
+      it('When deletion with remaining files, Then returns Package manifest (treated as modification)', async () => {
+        // Arrange
+        const existingFiles = [
+          'force-app/main/default/permissionsets/Admin/Admin.permissionset-meta.xml',
+          'force-app/main/default/permissionsets/Admin/objectSettings/Account.objectSettings-meta.xml',
+          'force-app/main/default/permissionsets/Admin/fieldPermissions/Account.Name.fieldPermissions-meta.xml',
+        ]
+        mockedReadDirs.mockResolvedValue(existingFiles)
+
+        const { changeType, element } = createElement(
+          `D       ${decomposedLine}`,
+          globalMetadata.get('permissionsets')!,
+          globalMetadata
+        )
+        const sut = new ContainedDecomposedHandler(
+          changeType,
+          element,
+          getContext({ config })
+        )
+
+        // Act
+        const result = await sut.collect()
+
+        // Assert
+        expect(elementsOf(result)).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              target: ManifestTarget.Package,
+              type: 'PermissionSet',
+              member: 'Admin',
+            }),
+          ])
+        )
+        expect(result.copies.length).toBeGreaterThan(0)
+      })
+
+      it('When deletion with no remaining files, Then returns DestructiveChanges manifest', async () => {
+        // Arrange
+        mockedReadDirs.mockResolvedValue([])
+
+        const { changeType, element } = createElement(
+          `D       ${decomposedLine}`,
+          globalMetadata.get('permissionsets')!,
+          globalMetadata
+        )
+        const sut = new ContainedDecomposedHandler(
+          changeType,
+          element,
+          getContext({ config })
+        )
+
+        // Act
+        const result = await sut.collect()
+
+        // Assert
+        expect(elementsOf(result)).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              target: ManifestTarget.DestructiveChanges,
+              type: 'PermissionSet',
+              member: 'Admin',
+            }),
+          ])
+        )
+        expect(result.copies).toHaveLength(0)
+      })
     })
 
-    it('should add deletion to the package.xml', async () => {
+    it('Given self-named decomposed file where dir matches parsed name, When addition, Then treated as decomposed with GitDirCopy', async () => {
       // Arrange
-      const sut = new ContainedDecomposedHandler(
-        `D       ${line}`,
-        globalMetadata.get('permissionsets')!,
-        work,
-        globalMetadata
-      )
-      // Act
-      await sut.handle()
-
-      // Assert
-      expect(work.diffs.package.has('PermissionSet')).toBe(false)
-      expect(work.diffs.destructiveChanges.get('PermissionSet')).toContain(
-        'Subject'
-      )
-      expect(copyFiles).not.toHaveBeenCalled()
-    })
-  })
-  describe.each([
-    'force-app/main/default/permissionsets/Admin/objectSettings/Account.objectSettings-meta.xml',
-    'force-app/main/default/permissionsets/Admin/Admin.flowAccesses-meta.xml',
-  ])('when it is decomposed', decomposedLine => {
-    it(`should copy all decomposed files when adding a file for "${decomposedLine}"`, async () => {
-      // Arrange
+      // This path triggers _isDecomposedFormat second condition:
+      // parsed.dir.split('/').pop() === parsed.name ('Subject' === 'Subject')
+      // while first condition is false because base includes '.permissionset'
+      const decomposedLine =
+        'A       force-app/main/default/permissionsets/Subject/Subject.permissionset'
       const existingFiles = [
-        'force-app/main/default/permissionsets/Admin/Admin.permissionset-meta.xml',
-        'force-app/main/default/permissionsets/Admin/objectSettings/Account.objectSettings-meta.xml',
-        'force-app/main/default/permissionsets/Admin/fieldPermissions/Account.Name.fieldPermissions-meta.xml',
+        'force-app/main/default/permissionsets/Subject/Subject.permissionset',
+        'force-app/main/default/permissionsets/Subject/objectSettings/Account.objectSettings-meta.xml',
       ]
       mockedReadDirs.mockResolvedValue(existingFiles)
-
-      const sut = new ContainedDecomposedHandler(
-        `A       ${decomposedLine}`,
+      const { changeType, element } = createElement(
+        decomposedLine,
         globalMetadata.get('permissionsets')!,
-        work,
         globalMetadata
+      )
+      const sut = new ContainedDecomposedHandler(
+        changeType,
+        element,
+        getContext({ config })
       )
 
       // Act
-      await sut.handle()
+      const result = await sut.collect()
 
       // Assert
-      expect(work.diffs.package.get('PermissionSet')).toContain('Admin')
-      expect(work.diffs.destructiveChanges.has('PermissionSet')).toBe(false)
-      expect(copyFiles).toHaveBeenCalledTimes(2)
+      expect(elementsOf(result)).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            target: ManifestTarget.Package,
+            type: 'PermissionSet',
+            member: 'Subject',
+          }),
+        ])
+      )
+      expect(
+        result.copies.some(c => c.kind === CopyOperationKind.GitDirCopy)
+      ).toBe(true)
     })
 
-    it(`should copy all decomposed files when modifying a file for "${decomposedLine}"`, async () => {
+    it('Given decomposed addition with generateDelta false, When collect, Then no GitDirCopy in copies', async () => {
       // Arrange
-      const existingFiles = [
-        'force-app/main/default/permissionsets/Admin/Admin.permissionset-meta.xml',
-        'force-app/main/default/permissionsets/Admin/objectSettings/Account.objectSettings-meta.xml',
-        'force-app/main/default/permissionsets/Admin/fieldPermissions/Account.Name.fieldPermissions-meta.xml',
-      ]
-      mockedReadDirs.mockResolvedValue(existingFiles)
-
-      const sut = new ContainedDecomposedHandler(
-        `M       ${decomposedLine}`,
+      config.generateDelta = false
+      const decomposedLine =
+        'A       force-app/main/default/permissionsets/Admin/objectSettings/Account.objectSettings-meta.xml'
+      const { changeType, element } = createElement(
+        decomposedLine,
         globalMetadata.get('permissionsets')!,
-        work,
         globalMetadata
+      )
+      const sut = new ContainedDecomposedHandler(
+        changeType,
+        element,
+        getContext({ config })
       )
 
       // Act
-      await sut.handle()
+      const result = await sut.collect()
 
       // Assert
-      expect(work.diffs.package.get('PermissionSet')).toContain('Admin')
-      expect(work.diffs.destructiveChanges.has('PermissionSet')).toBe(false)
-      expect(copyFiles).toHaveBeenCalledTimes(2)
+      expect(
+        result.copies.every(c => c.kind !== CopyOperationKind.GitDirCopy)
+      ).toBe(true)
     })
 
-    it(`should handle deletion with remaining files as modification for "${decomposedLine}"`, async () => {
+    it('Given decomposed addition, When collect, Then includes holder folder GitDirCopy', async () => {
       // Arrange
-      const existingFiles = [
-        'force-app/main/default/permissionsets/Admin/Admin.permissionset-meta.xml',
-        'force-app/main/default/permissionsets/Admin/objectSettings/Account.objectSettings-meta.xml',
-        'force-app/main/default/permissionsets/Admin/fieldPermissions/Account.Name.fieldPermissions-meta.xml',
-      ]
-      mockedReadDirs.mockResolvedValue(existingFiles)
-
-      const sut = new ContainedDecomposedHandler(
-        `D       ${decomposedLine}`,
+      const decomposedLine =
+        'A       force-app/main/default/permissionsets/Admin/objectSettings/Account.objectSettings-meta.xml'
+      const { changeType, element } = createElement(
+        decomposedLine,
         globalMetadata.get('permissionsets')!,
-        work,
         globalMetadata
+      )
+      const sut = new ContainedDecomposedHandler(
+        changeType,
+        element,
+        getContext({ config })
       )
 
       // Act
-      await sut.handle()
+      const result = await sut.collect()
 
       // Assert
-      expect(work.diffs.package.get('PermissionSet')).toContain('Admin')
-      expect(work.diffs.destructiveChanges.has('PermissionSet')).toBe(false)
-      expect(copyFiles).toHaveBeenCalledTimes(2)
+      expect(elementsOf(result)).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            target: ManifestTarget.Package,
+            type: 'PermissionSet',
+            member: 'Admin',
+          }),
+        ])
+      )
+      expect(
+        result.copies.some(
+          c =>
+            c.kind === CopyOperationKind.GitDirCopy &&
+            c.path.includes('permissionsets/Admin')
+        )
+      ).toBe(true)
+      expect(result.warnings).toHaveLength(0)
     })
 
-    it(`should handle deletion with no remaining files as destructive change for "${decomposedLine}"`, async () => {
+    it('Given decomposed addition, When collect, Then the element own copy from the parent call survives alongside the holder folder GitDirCopy (containedDecomposedHandler L28)', async () => {
       // Arrange
-      mockedReadDirs.mockResolvedValue([])
-
-      const sut = new ContainedDecomposedHandler(
-        `D       ${decomposedLine}`,
+      const decomposedLine =
+        'A       force-app/main/default/permissionsets/Admin/objectSettings/Account.objectSettings-meta.xml'
+      const { changeType, element } = createElement(
+        decomposedLine,
         globalMetadata.get('permissionsets')!,
-        work,
         globalMetadata
+      )
+      const sut = new ContainedDecomposedHandler(
+        changeType,
+        element,
+        getContext({ config })
       )
 
       // Act
-      await sut.handle()
+      const result = await sut.collect()
+
+      // Assert — a `copies = []` regression would discard the copy
+      // super.collectAddition() already produced for the element itself,
+      // leaving only the GitDirCopy _collectDirCopy appends.
+      expect(
+        result.copies.some(
+          c =>
+            c.kind === CopyOperationKind.GitCopy &&
+            c.path.includes('objectSettings/Account.objectSettings-meta.xml')
+        )
+      ).toBe(true)
+      expect(
+        result.copies.some(
+          c =>
+            c.kind === CopyOperationKind.GitDirCopy &&
+            c.path.includes('permissionsets/Admin')
+        )
+      ).toBe(true)
+    })
+
+    it('Given non-decomposed addition, When collect, Then returns manifest and file copy without holder', async () => {
+      // Arrange
+      const { changeType, element } = createElement(
+        'A       force-app/main/permissionsets/Subject.permissionset-meta.xml',
+        globalMetadata.get('permissionsets')!,
+        globalMetadata
+      )
+      const sut = new ContainedDecomposedHandler(
+        changeType,
+        element,
+        getContext({ config })
+      )
+
+      // Act
+      const result = await sut.collect()
 
       // Assert
-      expect(work.diffs.package.has('PermissionSet')).toBe(false)
-      expect(work.diffs.destructiveChanges.get('PermissionSet')).toContain(
-        'Admin'
+      expect(elementsOf(result)).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            target: ManifestTarget.Package,
+            type: 'PermissionSet',
+            member: 'Subject',
+          }),
+        ])
       )
-      expect(copyFiles).not.toHaveBeenCalled()
+      expect(
+        result.copies.every(c => c.kind === CopyOperationKind.GitCopy)
+      ).toBe(true)
+      expect(result.warnings).toHaveLength(0)
     })
   })
 })

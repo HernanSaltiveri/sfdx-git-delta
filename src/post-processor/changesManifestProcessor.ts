@@ -1,0 +1,80 @@
+'use strict'
+
+import { ChangeKind } from '../types/handlerResult.js'
+import type { Manifest } from '../types/work.js'
+import type ChangeSet from '../utils/changeSet.js'
+import type { RenameBucket } from '../utils/changeSet.js'
+import { outputFile } from '../utils/fsUtils.js'
+import { log } from '../utils/LoggingDecorator.js'
+import BaseProcessor, {
+  emptyOutcome,
+  type ProcessorOutcome,
+} from './baseProcessor.js'
+
+type RenameEntry = { from: string; to: string }
+type KindBucket = Record<string, string[]>
+type RenameTypeBucket = Record<string, RenameEntry[]>
+type ChangesManifestOutput = {
+  [ChangeKind.Add]: KindBucket
+  [ChangeKind.Modify]: KindBucket
+  [ChangeKind.Delete]: KindBucket
+  [ChangeKind.Rename]: RenameTypeBucket
+}
+
+export default class ChangesManifestProcessor extends BaseProcessor {
+  @log
+  public override async process(changes: ChangeSet): Promise<ProcessorOutcome> {
+    // Path resolution policy (see delta.ts flag parsing):
+    //   - bare `-c` is rewritten to <output>/changes.manifest.json at CLI time
+    //   - explicit value is resolved against cwd (relative) or used as-is
+    //     (absolute) — same convention as --ignore-file etc.
+    const targetPath = this.config.changesManifest
+    if (!targetPath) return emptyOutcome()
+
+    // ChangeSet.byChangeKind() already coalesces the delete bucket against
+    // add/modify/rename, and removes rename participants from add/delete, so
+    // the JSON view never lists the same component twice.
+    const view = changes.byChangeKind()
+    const payload: ChangesManifestOutput = {
+      [ChangeKind.Add]: this._buildKindBucket(view[ChangeKind.Add]),
+      [ChangeKind.Modify]: this._buildKindBucket(view[ChangeKind.Modify]),
+      [ChangeKind.Delete]: this._buildKindBucket(view[ChangeKind.Delete]),
+      [ChangeKind.Rename]: this._buildRenameBucket(view[ChangeKind.Rename]),
+    }
+    await outputFile(targetPath, JSON.stringify(payload, null, 2))
+    return emptyOutcome()
+  }
+
+  protected _buildKindBucket(manifest: Manifest): KindBucket {
+    const bucket: KindBucket = {}
+    // `!` is safe: keys come from manifest.keys() so get() cannot be undefined.
+    for (const type of [...manifest.keys()].sort()) {
+      bucket[type] = [...manifest.get(type)!].sort()
+    }
+    return bucket
+  }
+
+  protected _buildRenameBucket(renames: RenameBucket): RenameTypeBucket {
+    const bucket: RenameTypeBucket = {}
+    for (const type of [...renames.keys()].sort()) {
+      const pairs = [...renames.get(type)!.values()]
+        .map(({ from, to }) => ({ from, to }))
+        // Code-unit order, matching the bare .sort() on the type keys above:
+        // a locale-aware comparison would order the emitted manifest
+        // differently depending on the machine that generated it. Written
+        // branchlessly so the equal case needs no separate arm.
+        // The `>` term only ever needs to signal "not before" (0 or
+        // positive) to Array.prototype.sort's swap-iff-negative contract, so
+        // forcing it to `false`/0 or widening it to `>=` changes no
+        // reachable pairwise swap decision and thus no output order —
+        // confirmed empirically against the unmutated comparator over
+        // randomised arrays from 8 to 2000 entries, spanning the size at
+        // which the engine stops using insertion sort and starts merging.
+        // The `<` term is the one load-bearing half; it is covered by the
+        // equal-`to` stability test below.
+        .sort((a, b) => Number(a.to > b.to) - Number(a.to < b.to))
+      bucket[type] = pairs
+    }
+    return bucket
+  }
+}

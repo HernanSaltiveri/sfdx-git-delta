@@ -1,49 +1,77 @@
 'use strict'
-import { describe, expect, it, jest } from '@jest/globals'
-import { outputFile } from 'fs-extra'
 import { Ignore } from 'ignore'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 
+import {
+  createTreeReader,
+  type TreeReader,
+} from '../../../../src/adapter/treeReader'
 import type { Config } from '../../../../src/types/config'
 import type { Work } from '../../../../src/types/work'
 import {
-  copyFiles,
+  contentIncludes,
+  fileExists,
+  grepContentMatching,
+  grepContentUnder,
   pathExists,
   readDirs,
   readPathFromGit,
+  resetWrittenFiles,
   writeFile,
 } from '../../../../src/utils/fsHelper'
+import { outputFile } from '../../../../src/utils/fsUtils'
 import {
   buildIgnoreHelper,
   IgnoreHelper,
 } from '../../../../src/utils/ignoreHelper'
-import { getWork } from '../../../__utils__/globalTestHelper'
+import { getContext, getWork } from '../../../__utils__/testWork'
 
-jest.mock('fs-extra')
+vi.mock('../../../../src/utils/fsUtils', async orig => ({
+  ...(await orig<typeof import('../../../../src/utils/fsUtils')>()),
+  outputFile: vi.fn(),
+}))
 
-jest.mock('../../../../src/utils/ignoreHelper')
+vi.mock('../../../../src/utils/ignoreHelper')
 
-const mockBuildIgnoreHelper = jest.mocked(buildIgnoreHelper)
+vi.mock('../../../../src/utils/LoggingService')
 
-const mockGetStringContent = jest.fn()
-const mockGetFilesFrom = jest.fn()
-const mockGetFilesPath = jest.fn()
-const mockPathExists = jest.fn()
-jest.mock('../../../../src/adapter/GitAdapter', () => {
+import { Logger } from '../../../../src/utils/LoggingService'
+
+const mockBuildIgnoreHelper = vi.mocked(buildIgnoreHelper)
+
+const mockGetStringContent = vi.fn()
+const mockGrepUnderPaths = vi.fn()
+const mockGrepMatchingPathspecs = vi.fn()
+vi.mock('../../../../src/adapter/GitAdapter', () => {
   return {
     default: {
       getInstance: () => ({
         getStringContent: mockGetStringContent,
-        getFilesFrom: mockGetFilesFrom,
-        getFilesPath: mockGetFilesPath,
-        pathExists: mockPathExists,
+        grepUnderPaths: mockGrepUnderPaths,
+        grepMatchingPathspecs: mockGrepMatchingPathspecs,
       }),
     },
   }
 })
 
+// pathExists/readDirs no longer go through GitAdapter — they read the
+// run-owned TreeReader directly. Each method takes the revision as its own
+// first argument now, so assertions pin the revision at the call site
+// instead of through a separate holder lookup.
+const mockFilesUnder = vi.fn()
+const mockPathExists = vi.fn()
+const mockFileExists = vi.fn()
+const mockChildren = vi.fn()
+const treeReader = {
+  pathExists: mockPathExists,
+  fileExists: mockFileExists,
+  filesUnder: mockFilesUnder,
+  children: mockChildren,
+} as unknown as TreeReader
+
 let work: Work
 beforeEach(() => {
-  jest.resetAllMocks()
+  vi.clearAllMocks()
   work = getWork()
   work.config.from = 'pastsha'
   work.config.to = 'recentsha'
@@ -88,177 +116,39 @@ describe('readPathFromGit', () => {
       expect(content).toBe(value)
     })
   })
-})
 
-describe('copyFile', () => {
-  beforeEach(() => {
-    mockBuildIgnoreHelper.mockResolvedValue({
-      globalIgnore: {
-        ignores: () => false,
-      } as unknown as Ignore,
-    } as unknown as IgnoreHelper)
-  })
-  describe('when file is already copied', () => {
-    it('should not copy file', async () => {
-      await copyFiles(work.config, 'source/file')
-      jest.resetAllMocks()
-
-      // Act
-      await copyFiles(work.config, 'source/file')
-
-      // Assert
-      expect(mockGetStringContent).not.toHaveBeenCalled()
-      expect(outputFile).not.toHaveBeenCalled()
-    })
-  })
-
-  describe('when file is already written', () => {
-    it('should not copy file', async () => {
+  describe('when git adapter throws an error', () => {
+    beforeEach(() => {
       // Arrange
-      await writeFile('source/file', 'content', work.config)
-      jest.resetAllMocks()
-
-      // Act
-      await copyFiles(work.config, 'source/file')
-
-      // Assert
-      expect(outputFile).not.toHaveBeenCalled()
-    })
-  })
-
-  describe('when source location is empty', () => {
-    it('should copy file', async () => {
-      // Arrange
-      const sourcePath = 'source/copyFile'
-      mockGetFilesFrom.mockImplementation(async function* () {
-        yield await {
-          path: sourcePath,
-          content: Buffer.from(''),
-        }
-      })
-
-      // Act
-      await copyFiles(work.config, sourcePath)
-
-      // Assert
-      expect(mockGetFilesFrom).toHaveBeenCalled()
-      expect(outputFile).toHaveBeenCalledWith(
-        `output/${sourcePath}`,
-        Buffer.from('')
+      mockGetStringContent.mockImplementation(() =>
+        Promise.reject(new Error('git error'))
       )
     })
-  })
 
-  describe('when path is ignored', () => {
-    it('should not copy this path', async () => {
-      // Arrange
-      mockBuildIgnoreHelper.mockResolvedValue({
-        globalIgnore: {
-          ignores: () => true,
-        } as unknown as Ignore,
-      } as unknown as IgnoreHelper)
-
+    it('returns empty string and logs the error', async () => {
       // Act
-      await copyFiles(work.config, 'source/ignored')
+      const content = await readPathFromGit(
+        { path: 'path/file', oid: work.config.to },
+        work.config
+      )
 
       // Assert
-      expect(mockGetFilesFrom).not.toHaveBeenCalled()
-      expect(outputFile).not.toHaveBeenCalled()
-    })
-  })
-
-  describe('when content should be copied', () => {
-    describe('when source location is empty', () => {
-      it('should copy file', async () => {
-        // Arrange
-        mockGetFilesFrom.mockImplementation(async function* () {
-          yield await {
-            path: 'source/emptyFile',
-            content: Buffer.from(''),
-          }
-          yield await {
-            path: 'source/anotherEmptyFile',
-            content: Buffer.from(''),
-          }
-        })
-
-        // Act
-        await copyFiles(work.config, 'source/emptyFile')
-
-        // Assert
-        expect(mockGetFilesFrom).toHaveBeenCalled()
-        expect(outputFile).toHaveBeenCalledTimes(2)
-        expect(outputFile).toHaveBeenCalledWith(
-          'output/source/emptyFile',
-          Buffer.from('')
-        )
-        expect(outputFile).toHaveBeenCalledWith(
-          'output/source/anotherEmptyFile',
-          Buffer.from('')
-        )
-      })
+      expect(content).toBe('')
     })
 
-    describe('when source location is not empty', () => {
-      describe('when content is a folder', () => {
-        it('should copy the folder', async () => {
-          // Arrange
-          mockGetFilesFrom.mockImplementation(async function* () {
-            yield await {
-              path: 'copyDir/copyFile',
-              content: Buffer.from('content'),
-            }
-          })
+    it('When git adapter throws, Then Logger.debug is called (catch block body is not empty)', async () => {
+      // Arrange — the BlockStatement {} mutant empties the catch body, which
+      // means Logger.debug is never called. Asserting on it pins the catch body.
+      const debugSpy = vi.spyOn(Logger, 'debug')
 
-          // Act
-          await copyFiles(work.config, 'source/copyDir')
+      // Act
+      await readPathFromGit(
+        { path: 'path/file', oid: work.config.to },
+        work.config
+      )
 
-          // Assert
-          expect(mockGetFilesFrom).toHaveBeenCalledTimes(1)
-          expect(outputFile).toHaveBeenCalledTimes(1)
-          expect(outputFile).toHaveBeenCalledWith(
-            'output/copyDir/copyFile',
-            Buffer.from('content')
-          )
-        })
-      })
-
-      describe('when content is not a git location', () => {
-        it('should ignore this path', async () => {
-          // Arrange
-          mockGetFilesFrom.mockImplementation(async function* () {})
-
-          // Act
-          await copyFiles(work.config, 'source/warning')
-
-          // Assert
-          expect(mockGetFilesFrom).toHaveBeenCalled()
-          expect(outputFile).not.toHaveBeenCalled()
-        })
-      })
-      describe('when content is a file', () => {
-        beforeEach(async () => {
-          // Arrange
-          mockGetFilesFrom.mockImplementation(async function* () {
-            yield await {
-              path: 'source/copyFile',
-              content: Buffer.from('content'),
-            }
-          })
-        })
-        it('should copy the file', async () => {
-          // Act
-          await copyFiles(work.config, 'source/copyfile')
-
-          // Assert
-          expect(mockGetFilesFrom).toHaveBeenCalled()
-          expect(outputFile).toHaveBeenCalledTimes(1)
-          expect(outputFile).toHaveBeenCalledWith(
-            'output/source/copyFile',
-            Buffer.from('content')
-          )
-        })
-      })
+      // Assert — debug must have been called once for the error
+      expect(debugSpy).toHaveBeenCalledOnce()
     })
   })
 })
@@ -269,84 +159,231 @@ describe('readDirs', () => {
     const file = 'test.js'
     beforeEach(() => {
       // Arrange
-      mockGetFilesPath.mockImplementation(() =>
-        Promise.resolve([`${dir}${file}`])
-      )
+      mockFilesUnder.mockImplementation(() => [`${dir}${file}`])
     })
     it('should return the file', async () => {
       // Act
-      const dirContent = await readDirs(dir, work.config)
+      const dirContent = await readDirs(
+        dir,
+        getContext({ config: work.config, trees: treeReader })
+      )
 
       // Assert
       expect(dirContent).toEqual(expect.arrayContaining([`${dir}${file}`]))
-      expect(mockGetFilesPath).toHaveBeenCalled()
+      expect(mockFilesUnder).toHaveBeenCalled()
     })
 
     it('should work with an array of paths', async () => {
       // Arrange
       const paths = ['dir1/', 'dir2/']
-      mockGetFilesPath.mockImplementation(() =>
-        Promise.resolve(['dir1/file1.js', 'dir2/file2.js'])
-      )
+      mockFilesUnder.mockImplementation(() => [
+        'dir1/file1.js',
+        'dir2/file2.js',
+      ])
 
       // Act
-      const dirContent = await readDirs(paths, work.config)
+      const dirContent = await readDirs(
+        paths,
+        getContext({ config: work.config, trees: treeReader })
+      )
 
       // Assert
       expect(dirContent).toEqual(
         expect.arrayContaining(['dir1/file1.js', 'dir2/file2.js'])
       )
-      expect(mockGetFilesPath).toHaveBeenCalledWith(paths)
+      expect(mockFilesUnder).toHaveBeenCalledWith(work.config.to, paths)
     })
   })
 
-  describe('when path does not exist', () => {
-    beforeEach(() => {
+  describe('when the underlying reader degrades to empty for an unindexed revision', () => {
+    it('returns an empty array, unchanged', async () => {
       // Arrange
-      mockGetFilesPath.mockImplementation(() =>
-        Promise.reject(new Error('test'))
-      )
-    })
-    it('should throw', async () => {
+      const unbuiltTreeReader = createTreeReader(new Map())
+
       // Act
-      try {
-        await readDirs('path', work.config)
-      } catch (err) {
-        // Assert
-        expect(err).toBeTruthy()
-        expect(mockGetFilesPath).toHaveBeenCalled()
-      }
+      const dirContent = await readDirs(
+        'dir',
+        getContext({ config: work.config, trees: unbuiltTreeReader })
+      )
+
+      // Assert
+      expect(dirContent).toEqual([])
     })
+  })
+})
+
+describe('fileExists', () => {
+  it('Given the reader knows a file at `to`, When fileExists, Then returns true from the `to` revision', async () => {
+    // Arrange
+    mockFileExists.mockReturnValueOnce(true)
+    const ctx = getContext({ config: work.config, trees: treeReader })
+
+    // Act
+    const result = await fileExists('path', ctx)
+
+    // Assert
+    expect(result).toBe(true)
+    expect(mockFileExists).toHaveBeenCalledWith(work.config.to, 'path')
   })
 })
 
 describe('pathExists', () => {
   it('returns true when path is folder', async () => {
     // Arrange
-    mockPathExists.mockImplementation(() => Promise.resolve(true))
+    mockPathExists.mockImplementation(() => true)
 
     // Act
-    const result = await pathExists('path', work.config)
+    const result = await pathExists(
+      'path',
+      getContext({ config: work.config, trees: treeReader })
+    )
 
     // Assert
     expect(result).toBe(true)
+    expect(mockPathExists).toHaveBeenCalledWith(work.config.to, 'path')
   })
   it('returns true when path is file', async () => {
     // Arrange
-    mockPathExists.mockImplementation(() => Promise.resolve(true))
+    mockPathExists.mockImplementation(() => true)
 
     // Act
-    const result = await pathExists('path', work.config)
+    const result = await pathExists(
+      'path',
+      getContext({ config: work.config, trees: treeReader })
+    )
 
     // Assert
     expect(result).toBe(true)
+    expect(mockPathExists).toHaveBeenCalledWith(work.config.to, 'path')
   })
   it('returns false when path does not exist', async () => {
     // Arrange
-    mockPathExists.mockImplementation(() => Promise.resolve(false))
+    mockPathExists.mockImplementation(() => false)
 
     // Act
-    const result = await pathExists('not/existing/path', work.config)
+    const result = await pathExists(
+      'not/existing/path',
+      getContext({ config: work.config, trees: treeReader })
+    )
+
+    // Assert
+    expect(result).toBe(false)
+    expect(mockPathExists).toHaveBeenCalledWith(
+      work.config.to,
+      'not/existing/path'
+    )
+  })
+
+  describe('when the underlying reader degrades to false for an unindexed revision', () => {
+    it('returns false, unchanged', async () => {
+      // Arrange
+      const unbuiltTreeReader = createTreeReader(new Map())
+
+      // Act
+      const result = await pathExists(
+        'path',
+        getContext({ config: work.config, trees: unbuiltTreeReader })
+      )
+
+      // Assert
+      expect(result).toBe(false)
+    })
+  })
+})
+
+describe('grepContentUnder', () => {
+  it('Given matching pattern, When grepContentUnder, Then returns matching paths and routes through grepUnderPaths only', async () => {
+    // Arrange
+    const matchingFiles = ['fields/Account.field', 'fields/Contact.field']
+    mockGrepUnderPaths.mockImplementation(() => Promise.resolve(matchingFiles))
+
+    // Act
+    const result = await grepContentUnder('MasterDetail', 'fields', work.config)
+
+    // Assert
+    expect(result).toEqual(matchingFiles)
+    expect(mockGrepUnderPaths).toHaveBeenCalledWith(
+      'MasterDetail',
+      'fields',
+      work.config.to
+    )
+    expect(mockGrepMatchingPathspecs).not.toHaveBeenCalled()
+  })
+
+  it('Given no matches, When grepContentUnder, Then returns empty array', async () => {
+    // Arrange
+    mockGrepUnderPaths.mockImplementation(() => Promise.resolve([]))
+
+    // Act
+    const result = await grepContentUnder('nonexistent', 'fields', work.config)
+
+    // Assert
+    expect(result).toEqual([])
+  })
+})
+
+describe('grepContentMatching', () => {
+  it('Given multiple pathspecs, When grepContentMatching, Then passes the array to grepMatchingPathspecs only', async () => {
+    // Arrange
+    const matchingFiles = ['dir1/file1.xml', 'dir2/file2.xml']
+    mockGrepMatchingPathspecs.mockImplementation(() =>
+      Promise.resolve(matchingFiles)
+    )
+
+    // Act
+    const result = await grepContentMatching(
+      'flowDefinitions',
+      ['dir1/*.xml', 'dir2/*.xml'],
+      work.config
+    )
+
+    // Assert
+    expect(result).toEqual(matchingFiles)
+    expect(mockGrepMatchingPathspecs).toHaveBeenCalledWith(
+      'flowDefinitions',
+      ['dir1/*.xml', 'dir2/*.xml'],
+      work.config.to
+    )
+    expect(mockGrepUnderPaths).not.toHaveBeenCalled()
+  })
+
+  it('Given no matches, When grepContentMatching, Then returns empty array', async () => {
+    // Arrange
+    mockGrepMatchingPathspecs.mockImplementation(() => Promise.resolve([]))
+
+    // Act
+    const result = await grepContentMatching(
+      'nonexistent',
+      'fields/*.xml',
+      work.config
+    )
+
+    // Assert
+    expect(result).toEqual([])
+  })
+})
+
+describe('contentIncludes', () => {
+  it('Given matching pattern, When contentIncludes, Then returns true and routes through grepUnderPaths only', async () => {
+    // Arrange
+    mockGrepUnderPaths.mockImplementation(() =>
+      Promise.resolve(['fields/Account.field'])
+    )
+
+    // Act
+    const result = await contentIncludes('MasterDetail', 'fields', work.config)
+
+    // Assert
+    expect(result).toBe(true)
+    expect(mockGrepMatchingPathspecs).not.toHaveBeenCalled()
+  })
+
+  it('Given no matches, When contentIncludes, Then returns false', async () => {
+    // Arrange
+    mockGrepUnderPaths.mockImplementation(() => Promise.resolve([]))
+
+    // Act
+    const result = await contentIncludes('nonexistent', 'fields', work.config)
 
     // Assert
     expect(result).toBe(false)
@@ -403,5 +440,21 @@ describe('writeFile', () => {
 
     // Assert
     expect(outputFile).not.toHaveBeenCalled()
+  })
+
+  it('Given resetWrittenFiles called, When writing same path twice, Then outputFile is called twice', async () => {
+    // Arrange
+    const path = 'reset/path/file'
+    const config: Config = work.config
+    config.output = 'root'
+    const content = 'content'
+    await writeFile(path, content, config)
+
+    // Act
+    resetWrittenFiles()
+    await writeFile(path, content, config)
+
+    // Assert
+    expect(outputFile).toHaveBeenCalledTimes(2)
   })
 })

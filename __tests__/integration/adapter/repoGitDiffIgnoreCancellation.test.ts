@@ -1,0 +1,279 @@
+'use strict'
+import { rm, writeFile } from 'node:fs/promises'
+import { join } from 'node:path'
+
+import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest'
+
+import GitAdapter from '../../../src/adapter/GitAdapter'
+import { MetadataRepository } from '../../../src/metadata/MetadataRepository'
+import { getDefinition } from '../../../src/metadata/metadataManager'
+import type { Config } from '../../../src/types/config'
+import { IgnoreHelper } from '../../../src/utils/ignoreHelper'
+import RepoGitDiff from '../../../src/utils/repoGitDiff'
+import {
+  buildIgnoreFixtureRepo,
+  FIXTURE_HOOK_BUDGET_MS,
+  IGNORE_BUNDLE_MARKUP,
+  IGNORE_BUNDLE_STALE_MARKUP,
+  IGNORE_MOVED_CLASS,
+  IGNORE_MOVED_CLASS_META,
+  IGNORE_SOURCE_CLASS,
+  IGNORE_SOURCE_CLASS_META,
+  type IgnoreFixtureRefs,
+} from '../../__utils__/gitFixtureRepo'
+import { createTempDir } from '../../__utils__/gitTestHarness'
+import { sourceDirs } from '../../__utils__/sourceDirs'
+
+// An addition the global ignore rejects is held, not dropped: it cancels the
+// matching deletion only when, at `to`, nothing of its component is visible
+// outside the ignore set. A class moved wholesale into an ignored directory
+// therefore yields nothing — no destructive entry for a component that still
+// exists — while an ignored copy of a component that is still alive cannot
+// suppress a real deletion. The first case below was the guard that pinned
+// the previous ignore-first ordering; it was flipped on purpose when the gate
+// moved, not rediscovered by accident.
+//
+// The real RepoGitDiff drives a real GitAdapter and a real IgnoreHelper
+// reading a real pattern file here — the unit seam mocks both
+// buildIgnoreHelper and the `to`-tree read, so only this file exercises a
+// real pattern file against a real tree.
+//
+// The second block pins the trap the held-addition rule exists to avoid:
+// one file of a live bundle moved into the ignored directory is a stale
+// copy, not a move — the bundle's other files are still at `to` — so its
+// deletion must survive under every ordering. Both cases held under the old
+// ignore-first ordering and still hold now that the gate has moved — they are
+// the guard the move was made against.
+
+let fixtureDir: string
+let ignorePatternPath: string
+let unrelatedDestructivePatternPath: string
+let sourceClassesPatternPath: string
+let refs: IgnoreFixtureRefs
+let globalMetadata: MetadataRepository
+
+// Structurally enforces "identical to the no-ignore baseline" rather than
+// leaving it as a hand-copied literal in more than one case.
+const NO_IGNORE_BASELINE = [
+  `A\t${IGNORE_MOVED_CLASS}`,
+  `A\t${IGNORE_MOVED_CLASS_META}`,
+]
+const SOURCE_DELETION_SURVIVES = [
+  `D\t${IGNORE_SOURCE_CLASS}`,
+  `D\t${IGNORE_SOURCE_CLASS_META}`,
+]
+
+const makeConfig = (overrides: Partial<Config> = {}): Config => ({
+  to: refs.moved,
+  from: refs.root,
+  mergeBase: false,
+  output: '',
+  source: sourceDirs('.'),
+  repo: fixtureDir,
+  ignoreWhitespace: false,
+  generateDelta: false,
+  ignore: '',
+  ignoreDestructive: '',
+  ...overrides,
+})
+
+const collect = async (
+  lines: AsyncIterable<string>
+): Promise<readonly string[]> => {
+  const result: string[] = []
+  for await (const line of lines) result.push(line)
+  return result
+}
+
+beforeAll(async () => {
+  fixtureDir = await createTempDir('sgd-ignore-cancellation-fixture-')
+  refs = buildIgnoreFixtureRepo(fixtureDir)
+  globalMetadata = await getDefinition({})
+  // _buildIgnore reads this with a plain fs.readFile, which resolves a
+  // relative path against process.cwd() rather than the fixture directory —
+  // the path handed to config.ignore/ignoreDestructive must be absolute.
+  ignorePatternPath = join(fixtureDir, '.sgdignore-recycle-bin')
+  await writeFile(ignorePatternPath, 'force-app/recycle-bin/\n')
+  unrelatedDestructivePatternPath = join(fixtureDir, '.sgdignore-unrelated')
+  await writeFile(unrelatedDestructivePatternPath, 'nothing-here/\n')
+  sourceClassesPatternPath = join(fixtureDir, '.sgdignore-source-classes')
+  await writeFile(sourceClassesPatternPath, 'force-app/main/default/classes/\n')
+}, FIXTURE_HOOK_BUDGET_MS)
+
+afterEach(async () => {
+  // Both GitAdapter and IgnoreHelper cache a singleton keyed on the first
+  // call, so a later test in this file would otherwise reuse whichever
+  // instance an earlier one built.
+  await GitAdapter.closeAll()
+  IgnoreHelper.resetIgnoreInstance()
+})
+
+afterAll(async () => {
+  await rm(fixtureDir, { recursive: true, force: true })
+})
+
+describe('Given a class moved wholesale into a directory an ignore pattern covers', () => {
+  it('When --ignore-file covers the move destination, Then the source deletion is cancelled and nothing is yielded', async () => {
+    // Arrange
+    const config = makeConfig({ ignore: ignorePatternPath })
+    const sut = new RepoGitDiff(config, globalMetadata)
+
+    // Act
+    const result = await collect(sut.getLines())
+
+    // Assert
+    expect(result).toEqual([])
+  })
+
+  it('When no ignore file is configured, Then the deletion cancels against the addition', async () => {
+    // Arrange
+    const config = makeConfig()
+    const sut = new RepoGitDiff(config, globalMetadata)
+
+    // Act
+    const result = await collect(sut.getLines())
+
+    // Assert
+    expect(result).toEqual(NO_IGNORE_BASELINE)
+  })
+
+  it('When no ignore file is configured, Then the cancelled deletions are exposed', async () => {
+    // Arrange
+    const config = makeConfig()
+    const sut = new RepoGitDiff(config, globalMetadata)
+
+    // Act
+    await collect(sut.getLines())
+    const result = sut.getCancelledDeletions().map(d => d.line)
+
+    // Assert
+    expect(result).toEqual([
+      `D\t${IGNORE_SOURCE_CLASS}`,
+      `D\t${IGNORE_SOURCE_CLASS_META}`,
+    ])
+  })
+
+  it('When --ignore-file covers the move destination, Then no deletion is exposed as cancelled', async () => {
+    // Arrange
+    const config = makeConfig({ ignore: ignorePatternPath })
+    const sut = new RepoGitDiff(config, globalMetadata)
+
+    // Act
+    await collect(sut.getLines())
+    const result = sut.getCancelledDeletions()
+
+    // Assert
+    expect(result).toEqual([])
+  })
+
+  it('When an unrelated --ignore-destructive-file is also configured, Then the move is still cancelled', async () => {
+    // Arrange — visibility at `to` is decided by the global ignore alone.
+    // With a destructive ignore that covers nothing, the moved copies are
+    // still invisible, so the deletions must still cancel; were the
+    // visibility test to consult the destructive set instead, the copies
+    // would count as survivors and the deletions would reappear.
+    const config = makeConfig({
+      ignore: ignorePatternPath,
+      ignoreDestructive: unrelatedDestructivePatternPath,
+    })
+    const sut = new RepoGitDiff(config, globalMetadata)
+
+    // Act
+    const result = await collect(sut.getLines())
+
+    // Assert
+    expect(result).toEqual([])
+  })
+
+  it('When --ignore-destructive-file covers the move destination, Then the result is identical to the no-ignore baseline', async () => {
+    // Arrange — keep() routes A/M lines through the global ignore and only D
+    // lines through the destructive one, so a destructive-only pattern can
+    // never suppress an addition.
+    const config = makeConfig({ ignoreDestructive: ignorePatternPath })
+    const sut = new RepoGitDiff(config, globalMetadata)
+
+    // Act
+    const result = await collect(sut.getLines())
+
+    // Assert
+    expect(result).toEqual(NO_IGNORE_BASELINE)
+  })
+
+  it('When --source-dir excludes the move destination, Then the source deletion survives instead of being cancelled', async () => {
+    // Arrange — a pathspec applied inside GitAdapter, upstream of every gate.
+    const config = makeConfig({ source: sourceDirs('force-app/main') })
+    const sut = new RepoGitDiff(config, globalMetadata)
+
+    // Act
+    const result = await collect(sut.getLines())
+
+    // Assert
+    expect(result).toEqual(SOURCE_DELETION_SURVIVES)
+  })
+})
+
+describe('Given one bundle file moved into an ignored directory while the bundle stays live', () => {
+  it('When --ignore-file covers the destination, Then the deletion survives instead of being cancelled', async () => {
+    // Arrange — the bundle's script and meta file are still at `to`, so the
+    // recycle-bin copy is stale and cannot stand in for the component.
+    const config = makeConfig({ to: refs.staleCopy, ignore: ignorePatternPath })
+    const sut = new RepoGitDiff(config, globalMetadata)
+
+    // Act
+    const result = await collect(sut.getLines())
+
+    // Assert
+    expect(result).toEqual([`D\t${IGNORE_BUNDLE_MARKUP}`])
+  })
+
+  it('When no ignore file is configured, Then the kept addition cancels the deletion', async () => {
+    // Arrange — pins that the survival above comes from the ignore verdict,
+    // not from the diff shape.
+    const config = makeConfig({ to: refs.staleCopy })
+    const sut = new RepoGitDiff(config, globalMetadata)
+
+    // Act
+    const result = await collect(sut.getLines())
+
+    // Assert
+    expect(result).toEqual([`A\t${IGNORE_BUNDLE_STALE_MARKUP}`])
+  })
+})
+
+describe('Given a class deleted outright', () => {
+  it('When --ignore-destructive-file covers its path, Then the deletion is dropped', async () => {
+    // Arrange — a deletion consults only the destructive set, so a
+    // destructive pattern covering the deleted class's path suppresses it.
+    const config = makeConfig({
+      to: refs.deleted,
+      ignoreDestructive: sourceClassesPatternPath,
+    })
+    const sut = new RepoGitDiff(config, globalMetadata)
+
+    // Act
+    const result = await collect(sut.getLines())
+
+    // Assert
+    expect(result).toEqual([])
+  })
+
+  it('When only --ignore-file covers the same path, Then the deletion survives', async () => {
+    // Arrange — the global ignore never gates a deletion line, so the same
+    // pattern applied there leaves the deletion untouched. An unrelated
+    // destructive pattern is set explicitly: buildIgnore falls back to
+    // ignorePath for the destructive set when ignoreDestructive is empty,
+    // and that fallback would otherwise smuggle the global pattern back in.
+    const config = makeConfig({
+      to: refs.deleted,
+      ignore: sourceClassesPatternPath,
+      ignoreDestructive: unrelatedDestructivePatternPath,
+    })
+    const sut = new RepoGitDiff(config, globalMetadata)
+
+    // Act
+    const result = await collect(sut.getLines())
+
+    // Assert
+    expect(result).toEqual(SOURCE_DELETION_SURVIVES)
+  })
+})

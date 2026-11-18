@@ -1,5 +1,5 @@
 {
-  "$schema": "https://biomejs.dev/schemas/2.0.5/schema.json",
+  "$schema": "https://biomejs.dev/schemas/2.6.8/schema.json",
   "formatter": {
     "enabled": true,
     "formatWithErrors": false,
@@ -23,8 +23,12 @@
   "linter": {
     "enabled": true,
     "rules": {
-      "recommended": false,
+      "preset": "none",
       "complexity": {
+        "noExcessiveCognitiveComplexity": {
+          "level": "error",
+          "options": { "maxAllowedComplexity": 15 }
+        },
         "noExtraBooleanCast": "error",
         "noUselessCatch": "error",
         "noUselessThisAlias": "error",
@@ -99,7 +103,7 @@
     },
     "includes": [
       "**",
-      "!**/lib/**/*",
+      "!lib/**/*",
       "!**/node_modules",
       "!**/.next",
       "!**/output",

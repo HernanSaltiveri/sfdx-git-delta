@@ -1,179 +1,200 @@
 'use strict'
-import { join, ParsedPath, parse } from 'node:path/posix'
+import { join, parse } from 'node:path/posix'
 
-import { DOT, PATH_SEP } from '../constant/fsConstants.js'
-import {
-  ADDITION,
-  DELETION,
-  GIT_DIFF_TYPE_REGEX,
-  MODIFICATION,
-} from '../constant/gitConstants.js'
-import { META_REGEX, METAFILE_SUFFIX } from '../constant/metadataConstants.js'
-import { MetadataRepository } from '../metadata/MetadataRepository.js'
+import { ADDITION, DELETION, MODIFICATION } from '../constant/gitConstants.js'
+import { METAFILE_SUFFIX } from '../constant/metadataConstants.js'
 import type { Config } from '../types/config.js'
-import type { Metadata } from '../types/metadata.js'
-import type { Manifest, Manifests, Work } from '../types/work.js'
-import { copyFiles } from '../utils/fsHelper.js'
+import type {
+  AddKind,
+  CopyOperation,
+  HandlerResult,
+} from '../types/handlerResult.js'
+import {
+  ChangeKind,
+  CopyOperationKind,
+  emptyResult,
+  ManifestTarget,
+} from '../types/handlerResult.js'
+import type { RunContext } from '../types/runContext.js'
+import { getErrorMessage, wrapError } from '../utils/errorUtils.js'
+import { fileExists } from '../utils/fsHelper.js'
 import { log } from '../utils/LoggingDecorator.js'
 import { Logger, lazy } from '../utils/LoggingService.js'
-import { fillPackageWithParameter } from '../utils/packageHelper.js'
+import type { MetadataElement } from '../utils/metadataElement.js'
 
-const RegExpEscape = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+const CHANGE_KIND_BY_GIT_TYPE: Readonly<Record<string, AddKind>> = {
+  [ADDITION]: ChangeKind.Add,
+  [MODIFICATION]: ChangeKind.Modify,
+  [DELETION]: ChangeKind.Delete,
+}
 
+/**
+ * Strategy pattern base for metadata type handlers.
+ * Each Salesforce metadata type may need unique diff-collection behavior
+ * (e.g. custom element naming, parent object detection, deletion warnings).
+ * Subclasses override specific hooks (_getElementName, _isProcessable,
+ * collectAddition, collectDeletion, etc.) — even thin subclasses that override
+ * a single method justify their existence because they are selected at runtime
+ * by TypeHandlerFactory based on metadata type definitions.
+ */
 export default class StandardHandler {
-  protected readonly changeType: string
-  protected readonly diffs: Manifests
-  protected readonly config: Config
-  protected readonly warnings: Error[]
-  protected readonly splittedLine: string[]
-  protected suffixRegex: RegExp
-  protected readonly ext: string
-  protected readonly parsedLine: ParsedPath
-  protected readonly parentFolder: string
-
   constructor(
-    protected readonly line: string,
-    protected readonly metadataDef: Metadata,
-    protected readonly work: Work,
-    protected readonly metadata: MetadataRepository
-  ) {
-    this.changeType = line.charAt(0) as string
-    this.line = line.replace(GIT_DIFF_TYPE_REGEX, '')
-    this.diffs = work.diffs
-    this.config = work.config
-    this.warnings = work.warnings
-    this.splittedLine = this.line.split(PATH_SEP)
+    protected readonly changeType: string,
+    protected readonly element: MetadataElement,
+    protected readonly ctx: RunContext
+  ) {}
 
-    if (this.metadataDef.metaFile === true) {
-      this.line = this.line.replace(METAFILE_SUFFIX, '')
-    }
-
-    this.suffixRegex = new RegExp(`\\.${this.metadataDef.suffix}$`)
-    this.parsedLine = parse(this.line)
-    this.ext = this.parsedLine.base
-      .replace(METAFILE_SUFFIX, '')
-      .split(DOT)
-      .pop() as string
-    this.parentFolder = this.parsedLine.dir.split(PATH_SEP).slice(-1)[0]
+  protected get config(): Config {
+    return this.ctx.config
   }
 
   @log
-  public async handle() {
-    if (this._isProcessable()) {
-      try {
-        switch (this.changeType) {
-          case ADDITION:
-            await this.handleAddition()
-            break
-          case DELETION:
-            await this.handleDeletion()
-            break
-          case MODIFICATION:
-            await this.handleModification()
-            break
-        }
-      } catch (error) {
-        if (error instanceof Error) {
-          error.message = `${this.line}: ${error.message}`
-          this.warnings.push(error)
-        }
+  public async collect(): Promise<HandlerResult> {
+    if (!this._isProcessable()) {
+      return emptyResult()
+    }
+    try {
+      switch (this.changeType) {
+        case ADDITION:
+          return await this.collectAddition()
+        case DELETION:
+          return await this.collectDeletion()
+        case MODIFICATION:
+          return await this.collectModification()
+        default:
+          return emptyResult()
       }
+    } catch (error) {
+      const message = `${this.element.basePath}: ${getErrorMessage(error)}`
+      // Stryker disable CallExpression -- equivalent: removing either log call entirely is unobservable, because this file's tests mock LoggingService and assert on the wrapped warning in result.warnings via wrapError; asserting the emission itself would couple them to logging plumbing, which this project deliberately avoids
+      // Stryker disable next-line StringLiteral -- equivalent: lazy log content is observability only; tests assert on the wrapped warning message in result.warnings via wrapError, not on the lazy log line
+      Logger.warn(lazy`${message}`)
+      Logger.debug(
+        // Stryker disable next-line StringLiteral,ArrowFunction -- equivalent: same as above, debug log is observability only
+        lazy`${this.constructor.name}.collect: ${this.changeType} ${this.element.type.xmlName} '${this.element.basePath}' failed: ${() => getErrorMessage(error)}`
+      )
+      // Stryker restore CallExpression
+      return { elements: [], copies: [], warnings: [wrapError(message, error)] }
     }
   }
 
-  @log
-  public async handleAddition() {
-    Logger.info(
-      lazy`${this.metadataDef.xmlName!}.${() => this._getElementName()} created`
-    )
-    this._fillPackage(this.diffs.package)
-    if (!this.config.generateDelta) return
-
-    await this._copyWithMetaFile(this.line)
+  public async collectAddition(): Promise<HandlerResult> {
+    const copies: CopyOperation[] = []
+    this._collectCopyWithMetaFile(copies, this.element.basePath)
+    return {
+      elements: [this._collectManifestElement(ManifestTarget.Package)],
+      copies,
+      warnings: [],
+    }
   }
 
-  @log
-  public async handleDeletion() {
-    Logger.info(
-      lazy`${this.metadataDef.xmlName!}.${() => this._getElementName()} deleted`
-    )
-    this._fillPackage(this.diffs.destructiveChanges)
+  public async collectDeletion(): Promise<HandlerResult> {
+    return {
+      elements: [
+        this._collectManifestElement(ManifestTarget.DestructiveChanges),
+      ],
+      copies: [],
+      warnings: [],
+    }
   }
 
-  @log
-  public async handleModification() {
-    Logger.info(
-      lazy`${this.metadataDef.xmlName!}.${() => this._getElementName()} modified`
-    )
-    await this.handleAddition()
-  }
-
-  protected _getParsedPath() {
-    return parse(
-      this.splittedLine
-        .slice(
-          this.splittedLine.findIndex(x => x.includes(METAFILE_SUFFIX)) - 1
-        )
-        .join(PATH_SEP)
-        .replace(META_REGEX, '')
-    )
+  public async collectModification(): Promise<HandlerResult> {
+    return await this.collectAddition()
   }
 
   protected _getElementName() {
-    const parsedPath = this._getParsedPath()
-    return parsedPath.name
+    return this.element.componentName
   }
 
-  protected _fillPackage(store: Manifest) {
-    fillPackageWithParameter({
-      store,
-      type: this.metadataDef.xmlName!,
+  // Public accessor used by the rename resolver — lets main.ts map a rename
+  // path pair back to (type, member) without running collect() side-effects.
+  public getElementDescriptor(): { type: string; member: string } {
+    return {
+      type: this.element.type.xmlName!,
       member: this._getElementName(),
-    })
+    }
   }
 
-  protected async _copyWithMetaFile(src: string) {
+  public comparesElements(): boolean {
+    return false
+  }
+
+  protected _collectManifestElement(target: ManifestTarget) {
+    return {
+      target,
+      ...this.getElementDescriptor(),
+      changeKind: this._getChangeKind(),
+    }
+  }
+
+  protected _getChangeKind(): AddKind {
+    // collect()'s switch guarantees changeType is ADDITION | MODIFICATION |
+    // DELETION before _collectManifestElement runs, so the lookup always hits.
+    return CHANGE_KIND_BY_GIT_TYPE[this.changeType]!
+  }
+
+  protected _collectCopyWithMetaFile(
+    copies: CopyOperation[],
+    src: string
+  ): void {
     if (this._delegateFileCopy()) {
-      await this._copy(src)
+      this._collectCopy(copies, src)
       if (this._shouldCopyMetaFile(src)) {
-        await this._copy(this._getMetaTypeFilePath(src))
+        this._collectCopy(copies, this._getMetaTypeFilePath(src))
       }
     }
   }
 
-  protected async _copy(elementPath: string) {
-    if (this._delegateFileCopy()) {
-      await copyFiles(this.config, elementPath)
-    }
+  protected _collectCopy(copies: CopyOperation[], path: string): void {
+    if (!this._shouldCollectCopies()) return
+    copies.push({
+      kind: CopyOperationKind.GitCopy,
+      path,
+      revision: this.config.to,
+    })
+  }
+
+  // An extensionless content file is named exactly as its component, so the
+  // component expansion (members continue the path with `.` or `/`) cannot
+  // reach it.
+  protected async _collectExactNameCopy(
+    copies: CopyOperation[],
+    componentPath: string
+  ): Promise<void> {
+    if (!(await fileExists(componentPath, this.ctx))) return
+    this._collectCopy(copies, componentPath)
+  }
+
+  protected _collectComponentCopy(copies: CopyOperation[], path: string): void {
+    if (!this._shouldCollectCopies()) return
+    copies.push({
+      kind: CopyOperationKind.GitComponentCopy,
+      path,
+      revision: this.config.to,
+    })
+  }
+
+  protected _shouldCollectCopies(): boolean {
+    return this.config.generateDelta
   }
 
   protected _getMetaTypeFilePath(path: string) {
     const parsedPath = parse(path)
     return join(
       parsedPath.dir,
-      `${parsedPath.name}.${this.metadataDef.suffix}${METAFILE_SUFFIX}`
+      `${parsedPath.name}.${this.element.type.suffix}${METAFILE_SUFFIX}`
     )
   }
 
   protected _shouldCopyMetaFile(path: string): boolean {
     return (
-      this.metadataDef.metaFile === true && !`${path}`.endsWith(METAFILE_SUFFIX)
-    )
-  }
-
-  protected _parseLine() {
-    return this.line.match(
-      new RegExp(
-        `(?<path>.*[/\\\\]?${RegExpEscape(
-          this.metadataDef.directoryName
-        )})[/\\\\](?<name>[^/\\\\]*)+`,
-        'u'
-      )
+      this.element.type.metaFile === true &&
+      !`${path}`.endsWith(METAFILE_SUFFIX)
     )
   }
 
   protected _isProcessable() {
-    return this.metadataDef.suffix === this.ext
+    return this.element.type.suffix === this.element.extension
   }
 
   protected _delegateFileCopy() {
@@ -181,10 +202,10 @@ export default class StandardHandler {
   }
 
   protected _parentFolderIsNotTheType() {
-    return this.parentFolder !== this.metadataDef.directoryName
+    return this.element.parentFolder !== this.element.type.directoryName
   }
 
   public toString() {
-    return `${this.constructor.name}: ${this.changeType} -> ${this.line}`
+    return `${this.constructor.name}: ${this.changeType} -> ${this.element.basePath}`
   }
 }

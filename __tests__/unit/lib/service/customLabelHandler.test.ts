@@ -1,10 +1,31 @@
 'use strict'
-import { describe, expect, it, jest } from '@jest/globals'
+import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { MetadataRepository } from '../../../../src/metadata/MetadataRepository'
+import { getDefinition } from '../../../../src/metadata/metadataManager'
 import CustomLabelHandler from '../../../../src/service/customLabelHandler'
-import type { Work } from '../../../../src/types/work'
-import { getGlobalMetadata, getWork } from '../../../__utils__/globalTestHelper'
+import type { Config } from '../../../../src/types/config'
+import {
+  CopyOperationKind,
+  ManifestTarget,
+} from '../../../../src/types/handlerResult'
+import { elementsOf } from '../../../__utils__/handlerResultView'
+import { createElement } from '../../../__utils__/testElement'
+import { getConfig, getContext } from '../../../__utils__/testWork'
+
+const { mockRun, mockWriter } = vi.hoisted(() => ({
+  mockRun: vi.fn(),
+  mockWriter: vi.fn(),
+}))
+
+vi.mock('../../../../src/utils/metadataDiff', () => {
+  return {
+    default: vi.fn().mockImplementation(function () {
+      return { run: mockRun }
+    }),
+  }
+})
+vi.mock('../../../../src/utils/fsHelper')
 
 const labelType = {
   directoryName: 'labels',
@@ -20,69 +41,251 @@ const labelType = {
 
 let globalMetadata: MetadataRepository
 beforeAll(async () => {
-  globalMetadata = await getGlobalMetadata()
+  globalMetadata = await getDefinition({})
 })
-let work: Work
+let config: Config
 beforeEach(() => {
-  jest.clearAllMocks()
-  work = getWork()
+  vi.clearAllMocks()
+  config = getConfig()
 })
 
 describe('Decomposed CustomLabel spec', () => {
   const line = 'force-app/main/default/labels/Test.label-meta.xml'
-  describe('when file is added', () => {
-    let sut: CustomLabelHandler
-    beforeEach(() => {
+
+  describe('collect', () => {
+    it('Given decomposed label addition, When collectAddition, Then returns Package manifest', async () => {
       // Arrange
-      sut = new CustomLabelHandler(line, labelType, work, globalMetadata)
-    })
-    it('should add the element in the package', async () => {
-      // Arrange
+      const { changeType, element } = createElement(
+        `A       ${line}`,
+        labelType,
+        globalMetadata
+      )
+      const sut = new CustomLabelHandler(
+        changeType,
+        element,
+        getContext({ config })
+      )
 
       // Act
-      await sut.handleAddition()
+      const result = await sut.collectAddition()
 
       // Assert
-      expect(work.diffs.destructiveChanges.size).toEqual(0)
-      expect(work.diffs.package.get('CustomLabel')).toEqual(new Set(['Test']))
-    })
-  })
-
-  describe('when file is modified', () => {
-    let sut: CustomLabelHandler
-    beforeEach(() => {
-      // Arrange
-      sut = new CustomLabelHandler(line, labelType, work, globalMetadata)
-    })
-    it('should add the element in the package', async () => {
-      // Arrange
-
-      // Act
-      await sut.handleModification()
-
-      // Assert
-      expect(work.diffs.destructiveChanges.size).toEqual(0)
-      expect(work.diffs.package.get('CustomLabel')).toEqual(new Set(['Test']))
-    })
-  })
-
-  describe('when file is deleted', () => {
-    let sut: CustomLabelHandler
-    beforeEach(() => {
-      // Arrange
-      sut = new CustomLabelHandler(line, labelType, work, globalMetadata)
-    })
-    it('should add the element in the destructiveChanges', async () => {
-      // Arrange
-
-      // Act
-      await sut.handleDeletion()
-
-      // Assert
-      expect(work.diffs.package.size).toEqual(0)
-      expect(work.diffs.destructiveChanges.get('CustomLabel')).toEqual(
-        new Set(['Test'])
+      expect(elementsOf(result)).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            target: ManifestTarget.Package,
+            type: 'CustomLabel',
+            member: 'Test',
+          }),
+        ])
       )
     })
+
+    it('Given decomposed label modification, When collectModification, Then returns Package manifest', async () => {
+      // Arrange
+      const { changeType, element } = createElement(
+        `M       ${line}`,
+        labelType,
+        globalMetadata
+      )
+      const sut = new CustomLabelHandler(
+        changeType,
+        element,
+        getContext({ config })
+      )
+
+      // Act
+      const result = await sut.collectModification()
+
+      // Assert
+      expect(elementsOf(result)).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            target: ManifestTarget.Package,
+            type: 'CustomLabel',
+            member: 'Test',
+          }),
+        ])
+      )
+    })
+
+    it('Given decomposed label deletion, When collectDeletion, Then returns DestructiveChanges manifest', async () => {
+      // Arrange
+      const { changeType, element } = createElement(
+        `D       ${line}`,
+        labelType,
+        globalMetadata
+      )
+      const sut = new CustomLabelHandler(
+        changeType,
+        element,
+        getContext({ config })
+      )
+
+      // Act
+      const result = await sut.collectDeletion()
+
+      // Assert
+      expect(elementsOf(result)).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            target: ManifestTarget.DestructiveChanges,
+            type: 'CustomLabel',
+            member: 'Test',
+          }),
+        ])
+      )
+      expect(result.copies).toHaveLength(0)
+    })
+
+    it('Given decomposed label addition, When collect, Then returns Package manifest with GitCopy', async () => {
+      // Arrange
+      const decomposedLine =
+        'A       force-app/main/default/labels/Test.label-meta.xml'
+      const { changeType, element } = createElement(
+        decomposedLine,
+        labelType,
+        globalMetadata
+      )
+      const sut = new CustomLabelHandler(
+        changeType,
+        element,
+        getContext({ config })
+      )
+
+      // Act
+      const result = await sut.collect()
+
+      // Assert
+      expect(elementsOf(result)).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            target: ManifestTarget.Package,
+            type: 'CustomLabel',
+            member: 'Test',
+          }),
+        ])
+      )
+      expect(
+        result.copies.some(c => c.kind === CopyOperationKind.GitCopy)
+      ).toBe(true)
+      expect(result.warnings).toHaveLength(0)
+    })
+
+    it('Given inFile labels addition, When collect, Then delegates to inFile collect logic', async () => {
+      // Arrange
+      const inFileLine =
+        'A       force-app/main/default/labels/CustomLabels.labels-meta.xml'
+      const { changeType, element } = createElement(
+        inFileLine,
+        labelType,
+        globalMetadata
+      )
+      const sut = new CustomLabelHandler(
+        changeType,
+        element,
+        getContext({ config })
+      )
+      mockRun.mockImplementation(() =>
+        Promise.resolve({
+          manifests: {
+            added: [{ type: 'CustomLabel', member: 'MyLabel' }],
+            modified: [],
+            deleted: [],
+          },
+          hasPackageContent: true,
+          writer: mockWriter,
+        })
+      )
+
+      // Act
+      const result = await sut.collect()
+
+      // Assert
+      expect(elementsOf(result)).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            target: ManifestTarget.Package,
+            type: 'CustomLabel',
+            member: 'MyLabel',
+          }),
+        ])
+      )
+      expect(
+        result.copies.some(c => c.kind === CopyOperationKind.StreamedContent)
+      ).toBe(true)
+      expect(result.warnings).toHaveLength(0)
+    })
+
+    it('Given inFile labels addition with non-empty content, When collect, Then _collectsContainer prevents container manifest', async () => {
+      // Arrange
+      const inFileLine =
+        'A       force-app/main/default/labels/CustomLabels.labels-meta.xml'
+      const { changeType, element } = createElement(
+        inFileLine,
+        labelType,
+        globalMetadata
+      )
+      const sut = new CustomLabelHandler(
+        changeType,
+        element,
+        getContext({ config })
+      )
+      mockRun.mockImplementation(() =>
+        Promise.resolve({
+          manifests: {
+            added: [{ type: 'CustomLabel', member: 'MyLabel' }],
+            modified: [],
+            deleted: [],
+          },
+          hasPackageContent: true,
+          writer: mockWriter,
+        })
+      )
+
+      // Act
+      const result = await sut.collect()
+
+      // Assert
+      const containerManifest = elementsOf(result).find(
+        m => m.type === 'CustomLabels'
+      )
+      expect(containerManifest).toBeUndefined()
+      expect(elementsOf(result)).toHaveLength(1)
+      expect(elementsOf(result)[0].type).toBe('CustomLabel')
+    })
+  })
+})
+
+describe('CustomLabelHandler element comparison', () => {
+  const build = (line: string, type = labelType) => {
+    const { changeType, element } = createElement(line, type, globalMetadata)
+    return new CustomLabelHandler(changeType, element, getContext({ config }))
+  }
+
+  it('Given a CustomLabels container file, When asked whether it compares elements, Then it answers true', () => {
+    // Arrange
+    const sut = build(
+      'M       force-app/main/default/labels/CustomLabels.labels-meta.xml'
+    )
+
+    // Act
+    const result = sut.comparesElements()
+
+    // Assert
+    expect(result).toBe(true)
+  })
+
+  it('Given a decomposed label file, When asked whether it compares elements, Then it answers false', () => {
+    // Arrange
+    const sut = build(
+      'M       force-app/main/default/labels/Test.label-meta.xml'
+    )
+
+    // Act
+    const result = sut.comparesElements()
+
+    // Assert
+    expect(result).toBe(false)
   })
 })

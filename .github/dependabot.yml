@@ -7,13 +7,33 @@ updates:
       interval: "monthly"
     commit-message:
       prefix: "build"
+    groups:
+      github-actions:
+        patterns:
+          - "*"
 
+  # A single npm entry: Dependabot requires a unique combination of
+  # package-ecosystem, directory and target-branch, so this repository's
+  # dedicated @salesforce/source-deploy-retrieve feed cannot be a second entry.
+  # It is a group instead, which still yields its own pull request - what
+  # dependabot-auto-merge.yml needs, since it diffs the metadata registry,
+  # retitles to feat(metadata) and self-merges. That retitle is also why losing
+  # the entry-level commit-message prefix costs nothing.
   - package-ecosystem: "npm"
     directory: "/"
     schedule:
-      interval: "weekly"
+      interval: "daily"
     versioning-strategy: increase
     commit-message:
       prefix: "build"
     allow:
       - dependency-type: "all"
+    groups:
+      salesforce-source-deploy-retrieve:
+        patterns:
+          - "@salesforce/source-deploy-retrieve"
+      npm:
+        patterns:
+          - "*"
+        exclude-patterns:
+          - "@salesforce/source-deploy-retrieve"

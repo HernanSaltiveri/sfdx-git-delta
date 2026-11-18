@@ -1,35 +1,29 @@
 'use strict'
-import { join } from 'node:path/posix'
-
-import { PATH_SEP } from '../constant/fsConstants.js'
+import { dirname, join } from 'node:path/posix'
 import { METAFILE_SUFFIX } from '../constant/metadataConstants.js'
-import { log } from '../utils/LoggingDecorator.js'
+import type { CopyOperation, HandlerResult } from '../types/handlerResult.js'
 import StandardHandler from './standardHandler.js'
 
 export default class DecomposedHandler extends StandardHandler {
-  @log
-  public override async handleAddition() {
-    await super.handleAddition()
-    if (!this.config.generateDelta) return
-    await this._copyParent()
+  public override async collectAddition(): Promise<HandlerResult> {
+    const result = await super.collectAddition()
+    const copies = [...result.copies]
+    this._collectParentCopies(copies)
+    return { ...result, copies }
   }
 
-  protected async _copyParent() {
-    const parentDirPath = this.splittedLine
-      .slice(0, this.splittedLine.indexOf(this.metadataDef.directoryName))
-      .join(PATH_SEP)
+  protected _collectParentCopies(copies: CopyOperation[]): void {
+    const parentType = this.element.getParentType()
+    if (!parentType?.suffix) return
+
+    const parentDirPath = dirname(this.element.typeDirectoryPath)
     const parentTypeName = this.getParentName()
-
-    const parentTypeSuffix = this.metadata.get(
-      this.metadataDef.parentXmlName!
-    )!.suffix
-
+    const parentTypeSuffix = parentType.suffix
     const parentPath = join(
       parentDirPath,
       `${parentTypeName}.${parentTypeSuffix}${METAFILE_SUFFIX}`
     )
-
-    await this._copyWithMetaFile(parentPath)
+    this._collectCopyWithMetaFile(copies, parentPath)
   }
 
   protected override _getElementName() {
@@ -39,8 +33,6 @@ export default class DecomposedHandler extends StandardHandler {
   }
 
   protected getParentName() {
-    return this.splittedLine[
-      this.splittedLine.indexOf(this.metadataDef.directoryName) - 1
-    ]
+    return this.element.parentName
   }
 }

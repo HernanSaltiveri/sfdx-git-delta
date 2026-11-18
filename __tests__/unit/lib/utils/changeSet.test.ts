@@ -1,0 +1,851 @@
+'use strict'
+import { describe, expect, it } from 'vitest'
+
+import type { ManifestElement } from '../../../../src/types/handlerResult'
+import { ChangeKind, ManifestTarget } from '../../../../src/types/handlerResult'
+import ChangeSet from '../../../../src/utils/changeSet'
+
+describe('ChangeSet', () => {
+  describe('Given a fresh ChangeSet', () => {
+    it('When reading any view, Then every bucket is empty', () => {
+      // Arrange
+      const sut = new ChangeSet()
+
+      // Act & Assert
+      expect(sut.forPackageManifest().size).toBe(0)
+      expect(sut.forDestructiveManifest().size).toBe(0)
+      const byKind = sut.byChangeKind()
+      expect(byKind[ChangeKind.Add].size).toBe(0)
+      expect(byKind[ChangeKind.Modify].size).toBe(0)
+      expect(byKind[ChangeKind.Delete].size).toBe(0)
+      expect(byKind[ChangeKind.Rename].size).toBe(0)
+    })
+
+    it('When isEmpty is read, Then it returns true', () => {
+      // Arrange
+      const sut = new ChangeSet()
+
+      // Act & Assert
+      expect(sut.isEmpty()).toBe(true)
+    })
+  })
+
+  describe('Given a ChangeSet with an added element', () => {
+    it('When isEmpty is read, Then it returns false', () => {
+      // Arrange
+      const sut = ChangeSet.from([
+        {
+          target: ManifestTarget.Package,
+          type: 'ApexClass',
+          member: 'New',
+          changeKind: ChangeKind.Add,
+        },
+      ])
+
+      // Act & Assert
+      expect(sut.isEmpty()).toBe(false)
+    })
+  })
+
+  describe('Given a ChangeSet with only a recorded rename', () => {
+    it('When isEmpty is read, Then it returns false', () => {
+      // Arrange
+      const sut = ChangeSet.from(
+        [],
+        [{ type: 'ApexClass', from: 'Old', to: 'New' }]
+      )
+
+      // Act & Assert
+      expect(sut.isEmpty()).toBe(false)
+    })
+  })
+
+  describe('Given a ChangeSet with only a destructive deletion', () => {
+    it('When isEmpty is read, Then it returns false', () => {
+      // Arrange
+      const sut = ChangeSet.from([
+        {
+          target: ManifestTarget.DestructiveChanges,
+          type: 'ApexClass',
+          member: 'Old',
+          changeKind: ChangeKind.Delete,
+        },
+      ])
+
+      // Act & Assert
+      expect(sut.isEmpty()).toBe(false)
+    })
+  })
+
+  describe('Given add and modify entries', () => {
+    it('When reading forPackageManifest, Then it unions add ∪ modify per type', () => {
+      // Arrange
+      const sut = ChangeSet.from([
+        {
+          target: ManifestTarget.Package,
+          type: 'ApexClass',
+          member: 'New',
+          changeKind: ChangeKind.Add,
+        },
+        {
+          target: ManifestTarget.Package,
+          type: 'ApexClass',
+          member: 'Edited',
+          changeKind: ChangeKind.Modify,
+        },
+        {
+          target: ManifestTarget.Package,
+          type: 'CustomObject',
+          member: 'Account',
+          changeKind: ChangeKind.Modify,
+        },
+      ])
+
+      // Act
+      const result = sut.forPackageManifest()
+
+      // Assert
+      expect(result.get('ApexClass')).toEqual(new Set(['New', 'Edited']))
+      expect(result.get('CustomObject')).toEqual(new Set(['Account']))
+    })
+
+    it('When reading byChangeKind, Then the modify bucket carries the modify entry', () => {
+      // Arrange
+      const sut = ChangeSet.from([
+        {
+          target: ManifestTarget.Package,
+          type: 'ApexClass',
+          member: 'Edited',
+          changeKind: ChangeKind.Modify,
+        },
+      ])
+
+      // Act
+      const byKind = sut.byChangeKind()
+
+      // Assert
+      expect(byKind[ChangeKind.Modify].get('ApexClass')).toEqual(
+        new Set(['Edited'])
+      )
+    })
+  })
+
+  describe('Given only delete entries', () => {
+    it('When reading forDestructiveManifest, Then it returns all deletions', () => {
+      // Arrange
+      const sut = ChangeSet.from([
+        {
+          target: ManifestTarget.DestructiveChanges,
+          type: 'ApexTrigger',
+          member: 'Old',
+          changeKind: ChangeKind.Delete,
+        },
+      ])
+
+      // Act
+      const result = sut.forDestructiveManifest()
+
+      // Assert
+      expect(result.get('ApexTrigger')).toEqual(new Set(['Old']))
+    })
+  })
+
+  describe('Given a delete cancelled by an add', () => {
+    it('When reading forDestructiveManifest, Then the cancelled entry is dropped but the add remains', () => {
+      // Arrange
+      const sut = ChangeSet.from([
+        {
+          target: ManifestTarget.Package,
+          type: 'ApexClass',
+          member: 'ReAdded',
+          changeKind: ChangeKind.Add,
+        },
+        {
+          target: ManifestTarget.DestructiveChanges,
+          type: 'ApexClass',
+          member: 'ReAdded',
+          changeKind: ChangeKind.Delete,
+        },
+        {
+          target: ManifestTarget.DestructiveChanges,
+          type: 'ApexClass',
+          member: 'Truly',
+          changeKind: ChangeKind.Delete,
+        },
+      ])
+
+      // Act
+      const destructive = sut.forDestructiveManifest()
+      const pkg = sut.forPackageManifest()
+
+      // Assert
+      expect(destructive.get('ApexClass')).toEqual(new Set(['Truly']))
+      expect(pkg.get('ApexClass')).toEqual(new Set(['ReAdded']))
+    })
+  })
+
+  describe('Given every delete of a type is cancelled', () => {
+    it('When reading forDestructiveManifest, Then the type is omitted entirely', () => {
+      // Arrange
+      const sut = ChangeSet.from([
+        {
+          target: ManifestTarget.Package,
+          type: 'CustomLabels',
+          member: 'My.Label',
+          changeKind: ChangeKind.Modify,
+        },
+        {
+          target: ManifestTarget.DestructiveChanges,
+          type: 'CustomLabels',
+          member: 'My.Label',
+          changeKind: ChangeKind.Delete,
+        },
+      ])
+
+      // Act
+      const destructive = sut.forDestructiveManifest()
+
+      // Assert
+      expect(destructive.has('CustomLabels')).toBe(false)
+    })
+  })
+
+  describe('Given mixed entries', () => {
+    it('When reading byChangeKind, Then the delete bucket is already coalesced', () => {
+      // Arrange
+      const sut = ChangeSet.from([
+        {
+          target: ManifestTarget.Package,
+          type: 'ApexClass',
+          member: 'Foo',
+          changeKind: ChangeKind.Add,
+        },
+        {
+          target: ManifestTarget.DestructiveChanges,
+          type: 'ApexClass',
+          member: 'Foo',
+          changeKind: ChangeKind.Delete,
+        },
+        {
+          target: ManifestTarget.DestructiveChanges,
+          type: 'ApexClass',
+          member: 'Bar',
+          changeKind: ChangeKind.Delete,
+        },
+      ])
+
+      // Act
+      const view = sut.byChangeKind()
+
+      // Assert
+      expect(view[ChangeKind.Add].get('ApexClass')).toEqual(new Set(['Foo']))
+      expect(view[ChangeKind.Delete].get('ApexClass')).toEqual(new Set(['Bar']))
+    })
+  })
+
+  describe('Given the same member added twice under the same kind', () => {
+    it('When reading the view, Then deduplication via Set is preserved', () => {
+      // Arrange
+      const sut = ChangeSet.from([
+        {
+          target: ManifestTarget.Package,
+          type: 'ApexClass',
+          member: 'Foo',
+          changeKind: ChangeKind.Add,
+        },
+        {
+          target: ManifestTarget.Package,
+          type: 'ApexClass',
+          member: 'Foo',
+          changeKind: ChangeKind.Add,
+        },
+      ])
+
+      // Act & Assert
+      expect(sut.forPackageManifest().get('ApexClass')).toEqual(
+        new Set(['Foo'])
+      )
+    })
+  })
+
+  describe('Given a non-conventional (target, changeKind) pair (e.g. InFileHandler stamping a deleted container as Package+Delete to preserve surviving sub-elements)', () => {
+    it('When reading the xml and JSON views, Then the xml manifests route on target (package) while byChangeKind routes on changeKind (delete)', () => {
+      // Arrange — ManifestElement carries both axes explicitly so callers
+      // that diverge from the conventional Delete → DestructiveChanges
+      // pairing can stamp Package+Delete. This is the case InFileHandler
+      // hits when a CustomLabels container file is deleted but some
+      // children survive: the deployment manifest must keep it in
+      // package.xml while reviewers still see a delete in the JSON.
+      const sut = ChangeSet.from([
+        {
+          target: ManifestTarget.Package,
+          type: 'CustomLabels',
+          member: 'CustomLabels',
+          changeKind: ChangeKind.Delete,
+        },
+      ])
+
+      // Act
+      const pkg = sut.forPackageManifest()
+      const destructive = sut.forDestructiveManifest()
+      const byKind = sut.byChangeKind()
+
+      // Assert
+      expect(pkg.get('CustomLabels')).toEqual(new Set(['CustomLabels']))
+      expect(destructive.has('CustomLabels')).toBe(false)
+      expect(byKind[ChangeKind.Delete].get('CustomLabels')).toEqual(
+        new Set(['CustomLabels'])
+      )
+      expect(byKind[ChangeKind.Add].has('CustomLabels')).toBe(false)
+    })
+  })
+
+  describe('ChangeSet.from factory', () => {
+    it('Given ManifestElements, When constructing via from, Then each element lands in its declared kind bucket', () => {
+      // Arrange
+      const elements: ManifestElement[] = [
+        {
+          target: ManifestTarget.Package,
+          type: 'ApexClass',
+          member: 'A',
+          changeKind: ChangeKind.Add,
+        },
+        {
+          target: ManifestTarget.Package,
+          type: 'ApexClass',
+          member: 'B',
+          changeKind: ChangeKind.Modify,
+        },
+        {
+          target: ManifestTarget.DestructiveChanges,
+          type: 'ApexTrigger',
+          member: 'C',
+          changeKind: ChangeKind.Delete,
+        },
+      ]
+
+      // Act
+      const sut = ChangeSet.from(elements)
+
+      // Assert
+      expect(sut.forPackageManifest().get('ApexClass')).toEqual(
+        new Set(['A', 'B'])
+      )
+      expect(sut.forDestructiveManifest().get('ApexTrigger')).toEqual(
+        new Set(['C'])
+      )
+    })
+
+    it('Given no renames argument, When constructing via the 1-argument form, Then the rename bucket stays empty', () => {
+      // Arrange
+      const elements: ManifestElement[] = [
+        {
+          target: ManifestTarget.Package,
+          type: 'ApexClass',
+          member: 'A',
+          changeKind: ChangeKind.Add,
+        },
+      ]
+
+      // Act
+      const sut = ChangeSet.from(elements)
+
+      // Assert
+      expect(sut.byChangeKind()[ChangeKind.Rename].size).toBe(0)
+    })
+  })
+
+  describe('Given a type that appears in both byTarget[Package] and as a rename target', () => {
+    it('When reading forPackageManifest, Then members from both sources merge into the same type bucket', () => {
+      // Arrange — exercises the _unionByType "type already exists, merge
+      // members into the existing Set" branch. Without the merge, the
+      // rename-target entry would overwrite the direct Package add.
+      const sut = ChangeSet.from(
+        [
+          {
+            target: ManifestTarget.Package,
+            type: 'ApexClass',
+            member: 'DirectAdd',
+            changeKind: ChangeKind.Add,
+          },
+        ],
+        [{ type: 'ApexClass', from: 'OldName', to: 'RenamedTo' }]
+      )
+
+      // Act
+      const pkg = sut.forPackageManifest()
+
+      // Assert
+      expect(pkg.get('ApexClass')).toEqual(new Set(['DirectAdd', 'RenamedTo']))
+    })
+  })
+
+  describe('ChangeSet.from renames channel', () => {
+    it('Given matching synthetic add/delete, When constructing with a rename triple, Then the package view keeps to-member, destructive view keeps from-member, and by-kind add/delete drop them', () => {
+      // Arrange — the handler pipeline first sees the split A/D lines, then
+      // main.ts resolves the rename pair and folds it in via ChangeSet.from.
+      const sut = ChangeSet.from(
+        [
+          {
+            target: ManifestTarget.Package,
+            type: 'ApexClass',
+            member: 'NewName',
+            changeKind: ChangeKind.Add,
+          },
+          {
+            target: ManifestTarget.DestructiveChanges,
+            type: 'ApexClass',
+            member: 'OldName',
+            changeKind: ChangeKind.Delete,
+          },
+        ],
+        [{ type: 'ApexClass', from: 'OldName', to: 'NewName' }]
+      )
+
+      // Act
+      const pkg = sut.forPackageManifest()
+      const destructive = sut.forDestructiveManifest()
+      const byKind = sut.byChangeKind()
+
+      // Assert
+      expect(pkg.get('ApexClass')).toEqual(new Set(['NewName']))
+      expect(destructive.get('ApexClass')).toEqual(new Set(['OldName']))
+      expect(byKind[ChangeKind.Add].has('ApexClass')).toBe(false)
+      expect(byKind[ChangeKind.Delete].has('ApexClass')).toBe(false)
+      const renameMap = byKind[ChangeKind.Rename].get('ApexClass')!
+      expect([...renameMap.values()]).toEqual([
+        { from: 'OldName', to: 'NewName' },
+      ])
+    })
+
+    it('Given a no-op rename where from equals to, When constructing, Then it is ignored', () => {
+      // Arrange
+      const sut = ChangeSet.from(
+        [],
+        [{ type: 'ApexClass', from: 'Same', to: 'Same' }]
+      )
+
+      // Act & Assert
+      expect(sut.byChangeKind()[ChangeKind.Rename].size).toBe(0)
+    })
+
+    it('Given the same rename pair passed twice (e.g. bundle rename re-emitted per file), When constructing, Then it collapses to a single entry', () => {
+      // Arrange — the dedup key is `${from}\0${to}`, so only *identical*
+      // pairs collapse. Collisions where `from` matches but `to` differs
+      // (or vice versa) are not reachable in practice: RenameResolver is
+      // fed one git-detected rename per component, and LWC bundle files
+      // only synthesise duplicate identical pairs. Omitted from coverage.
+      const sut = ChangeSet.from(
+        [],
+        [
+          { type: 'LightningComponentBundle', from: 'old', to: 'new' },
+          { type: 'LightningComponentBundle', from: 'old', to: 'new' },
+        ]
+      )
+
+      // Act
+      const bucket = sut
+        .byChangeKind()
+        [ChangeKind.Rename].get('LightningComponentBundle')!
+
+      // Assert
+      expect(bucket.size).toBe(1)
+      expect([...bucket.values()]).toEqual([{ from: 'old', to: 'new' }])
+    })
+  })
+
+  describe('Given a Bot and one of its versions are both deleted', () => {
+    it('When another bot version is also deleted, Then only the matching version is suppressed', () => {
+      // Arrange
+      const sut = ChangeSet.from([
+        {
+          target: ManifestTarget.DestructiveChanges,
+          type: 'Bot',
+          member: 'X',
+          changeKind: ChangeKind.Delete,
+        },
+        {
+          target: ManifestTarget.DestructiveChanges,
+          type: 'BotVersion',
+          member: 'X.v1',
+          changeKind: ChangeKind.Delete,
+        },
+        {
+          target: ManifestTarget.DestructiveChanges,
+          type: 'BotVersion',
+          member: 'Y.v1',
+          changeKind: ChangeKind.Delete,
+        },
+      ])
+
+      // Act
+      const result = sut.forDestructiveManifest()
+
+      // Assert
+      expect(result.get('BotVersion')).toEqual(new Set(['Y.v1']))
+    })
+
+    it('When only a different bot version is deleted, Then that version is unaffected', () => {
+      // Arrange
+      const sut = ChangeSet.from([
+        {
+          target: ManifestTarget.DestructiveChanges,
+          type: 'Bot',
+          member: 'X',
+          changeKind: ChangeKind.Delete,
+        },
+        {
+          target: ManifestTarget.DestructiveChanges,
+          type: 'BotVersion',
+          member: 'Y.v1',
+          changeKind: ChangeKind.Delete,
+        },
+      ])
+
+      // Act
+      const result = sut.forDestructiveManifest()
+
+      // Assert
+      expect(result.get('BotVersion')).toEqual(new Set(['Y.v1']))
+    })
+
+    it('When only the matching bot version is deleted, Then the BotVersion type is dropped entirely', () => {
+      // Arrange
+      const sut = ChangeSet.from([
+        {
+          target: ManifestTarget.DestructiveChanges,
+          type: 'Bot',
+          member: 'X',
+          changeKind: ChangeKind.Delete,
+        },
+        {
+          target: ManifestTarget.DestructiveChanges,
+          type: 'BotVersion',
+          member: 'X.v1',
+          changeKind: ChangeKind.Delete,
+        },
+      ])
+
+      // Act
+      const result = sut.forDestructiveManifest()
+
+      // Assert
+      expect(result.has('BotVersion')).toBe(false)
+      expect(result.get('Bot')).toEqual(new Set(['X']))
+    })
+  })
+
+  describe('Given only a bot version is deleted', () => {
+    it('When the destructive manifest is read, Then the version is unchanged', () => {
+      // Arrange
+      const sut = ChangeSet.from([
+        {
+          target: ManifestTarget.DestructiveChanges,
+          type: 'BotVersion',
+          member: 'X.v1',
+          changeKind: ChangeKind.Delete,
+        },
+      ])
+
+      // Act
+      const result = sut.forDestructiveManifest()
+
+      // Assert
+      expect(result.get('BotVersion')).toEqual(new Set(['X.v1']))
+    })
+  })
+
+  describe('Given only a bot is deleted', () => {
+    it('When the destructive manifest is read, Then the manifest is unchanged', () => {
+      // Arrange
+      const sut = ChangeSet.from([
+        {
+          target: ManifestTarget.DestructiveChanges,
+          type: 'Bot',
+          member: 'X',
+          changeKind: ChangeKind.Delete,
+        },
+      ])
+
+      // Act
+      const result = sut.forDestructiveManifest()
+
+      // Assert
+      expect(result.get('Bot')).toEqual(new Set(['X']))
+      expect(result.has('BotVersion')).toBe(false)
+    })
+  })
+
+  describe('Given a record type deleted outright', () => {
+    it('When reading the destructive manifest, Then it carries no record type member', () => {
+      // Arrange
+      const sut = ChangeSet.from([
+        {
+          target: ManifestTarget.DestructiveChanges,
+          type: 'RecordType',
+          member: 'Account.Alpha',
+          changeKind: ChangeKind.Delete,
+        },
+      ])
+
+      // Act
+      const result = sut.forDestructiveManifest()
+
+      // Assert
+      expect(result.has('RecordType')).toBe(false)
+    })
+
+    it('When reading the review view, Then the record type deletion is still visible', () => {
+      // Arrange
+      const sut = ChangeSet.from([
+        {
+          target: ManifestTarget.DestructiveChanges,
+          type: 'RecordType',
+          member: 'Account.Alpha',
+          changeKind: ChangeKind.Delete,
+        },
+      ])
+
+      // Act
+      const result = sut.byChangeKind()[ChangeKind.Delete].get('RecordType')
+
+      // Assert
+      expect(result).toEqual(new Set(['Account.Alpha']))
+    })
+
+    it('When reading undeletable deletions, Then it carries the omitted member', () => {
+      // Arrange
+      const sut = ChangeSet.from([
+        {
+          target: ManifestTarget.DestructiveChanges,
+          type: 'RecordType',
+          member: 'Account.Alpha',
+          changeKind: ChangeKind.Delete,
+        },
+      ])
+
+      // Act
+      const result = sut.undeletableDeletions()
+
+      // Assert
+      expect(result.get('RecordType')).toEqual(new Set(['Account.Alpha']))
+    })
+  })
+
+  describe('Given a record type rename', () => {
+    it('When reading every view, Then the destructive view drops it, the package view keeps the target, and the rename pair survives', () => {
+      // Arrange
+      const sut = ChangeSet.from(
+        [],
+        [{ type: 'RecordType', from: 'Account.Alpha', to: 'Account.Beta' }]
+      )
+
+      // Act
+      const destructive = sut.forDestructiveManifest()
+      const pkg = sut.forPackageManifest()
+      const renames = sut.byChangeKind()[ChangeKind.Rename].get('RecordType')!
+
+      // Assert
+      expect(destructive.has('RecordType')).toBe(false)
+      expect(pkg.get('RecordType')).toEqual(new Set(['Account.Beta']))
+      expect([...renames.values()]).toEqual([
+        { from: 'Account.Alpha', to: 'Account.Beta' },
+      ])
+    })
+
+    it('When reading undeletable deletions, Then the rename source is reported while the rename pair still survives', () => {
+      // Arrange
+      const sut = ChangeSet.from(
+        [],
+        [{ type: 'RecordType', from: 'Account.Alpha', to: 'Account.Beta' }]
+      )
+
+      // Act
+      const undeletable = sut.undeletableDeletions()
+      const renames = sut.byChangeKind()[ChangeKind.Rename].get('RecordType')!
+
+      // Assert
+      expect(undeletable.get('RecordType')).toEqual(new Set(['Account.Alpha']))
+      expect([...renames.values()]).toEqual([
+        { from: 'Account.Alpha', to: 'Account.Beta' },
+      ])
+    })
+  })
+
+  describe('Given a record type deleted alongside its holder object', () => {
+    it('When reading undeletable deletions, Then the member is not reported because the deploy destroys its holder', () => {
+      // Arrange — deleting a decomposed object folder emits the holder and
+      // its record type as two independent destructive entries.
+      const sut = ChangeSet.from([
+        {
+          target: ManifestTarget.DestructiveChanges,
+          type: 'CustomObject',
+          member: 'Account',
+          changeKind: ChangeKind.Delete,
+        },
+        {
+          target: ManifestTarget.DestructiveChanges,
+          type: 'RecordType',
+          member: 'Account.Alpha',
+          changeKind: ChangeKind.Delete,
+        },
+      ])
+
+      // Act
+      const result = sut.undeletableDeletions()
+
+      // Assert
+      expect(result.size).toBe(0)
+    })
+
+    it('When only a sibling holder is deleted, Then the member is still reported', () => {
+      // Arrange — Contact goes, Account stays, so Account.Alpha really is
+      // orphaned and still needs manual removal.
+      const sut = ChangeSet.from([
+        {
+          target: ManifestTarget.DestructiveChanges,
+          type: 'CustomObject',
+          member: 'Contact',
+          changeKind: ChangeKind.Delete,
+        },
+        {
+          target: ManifestTarget.DestructiveChanges,
+          type: 'RecordType',
+          member: 'Account.Alpha',
+          changeKind: ChangeKind.Delete,
+        },
+      ])
+
+      // Act
+      const result = sut.undeletableDeletions()
+
+      // Assert
+      expect(result.get('RecordType')).toEqual(new Set(['Account.Alpha']))
+    })
+  })
+
+  describe('Given a holder object deleted with no record type beside it', () => {
+    it('When reading undeletable deletions, Then it reports nothing without reaching for absent members', () => {
+      // Arrange — deleting an object that carries no record types is the
+      // ordinary case; the undeletable type is simply absent from the view.
+      const sut = ChangeSet.from([
+        {
+          target: ManifestTarget.DestructiveChanges,
+          type: 'CustomObject',
+          member: 'Account',
+          changeKind: ChangeKind.Delete,
+        },
+      ])
+
+      // Act
+      const result = sut.undeletableDeletions()
+
+      // Assert
+      expect(result.size).toBe(0)
+    })
+  })
+
+  describe('Given a record type the package view already covers', () => {
+    it('When reading undeletable deletions, Then nothing is reported because nothing is omitted', () => {
+      // Arrange — the member is both deleted and packaged, so the
+      // subtraction inside the orphaned-deletes projection cancels it and
+      // the destructive view never omits it in the first place.
+      const sut = ChangeSet.from([
+        {
+          target: ManifestTarget.DestructiveChanges,
+          type: 'RecordType',
+          member: 'Account.Alpha',
+          changeKind: ChangeKind.Delete,
+        },
+        {
+          target: ManifestTarget.Package,
+          type: 'RecordType',
+          member: 'Account.Alpha',
+          changeKind: ChangeKind.Add,
+        },
+      ])
+
+      // Act
+      const result = sut.undeletableDeletions()
+
+      // Assert
+      expect(result.size).toBe(0)
+    })
+  })
+
+  describe('Given a change set with no undeletable member', () => {
+    it('When reading undeletable deletions, Then it reports nothing', () => {
+      // Arrange
+      const sut = ChangeSet.from([
+        {
+          target: ManifestTarget.DestructiveChanges,
+          type: 'ApexClass',
+          member: 'Foo',
+          changeKind: ChangeKind.Delete,
+        },
+      ])
+
+      // Act
+      const result = sut.undeletableDeletions()
+
+      // Assert
+      expect(result.size).toBe(0)
+    })
+  })
+
+  describe('Given report, bot and record type members in one destructive view', () => {
+    it('When reading the destructive manifest, Then the sibling suppressors are unaffected and only the record type is stripped', () => {
+      // Arrange — a Report suppressed by the folder-move suppressor (its
+      // DeveloperName survives under the new package member), a Report that
+      // survives untouched, a Bot/BotVersion pair suppressed by the bot
+      // suppressor, and a RecordType only the new strip should remove.
+      const sut = ChangeSet.from([
+        {
+          target: ManifestTarget.Package,
+          type: 'Report',
+          member: 'NewFolder/My_Report',
+          changeKind: ChangeKind.Add,
+        },
+        {
+          target: ManifestTarget.DestructiveChanges,
+          type: 'Report',
+          member: 'OldFolder/My_Report',
+          changeKind: ChangeKind.Delete,
+        },
+        {
+          target: ManifestTarget.DestructiveChanges,
+          type: 'Report',
+          member: 'OldFolder/Other_Report',
+          changeKind: ChangeKind.Delete,
+        },
+        {
+          target: ManifestTarget.DestructiveChanges,
+          type: 'Bot',
+          member: 'X',
+          changeKind: ChangeKind.Delete,
+        },
+        {
+          target: ManifestTarget.DestructiveChanges,
+          type: 'BotVersion',
+          member: 'X.v1',
+          changeKind: ChangeKind.Delete,
+        },
+        {
+          target: ManifestTarget.DestructiveChanges,
+          type: 'RecordType',
+          member: 'Account.Alpha',
+          changeKind: ChangeKind.Delete,
+        },
+      ])
+
+      // Act
+      const result = sut.forDestructiveManifest()
+
+      // Assert
+      expect(result.get('Report')).toEqual(new Set(['OldFolder/Other_Report']))
+      expect(result.get('Bot')).toEqual(new Set(['X']))
+      expect(result.has('BotVersion')).toBe(false)
+      expect(result.has('RecordType')).toBe(false)
+    })
+  })
+})

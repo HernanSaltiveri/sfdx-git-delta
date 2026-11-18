@@ -2,10 +2,20 @@
 
 We encourage the developer community to contribute to this repository. This guide has instructions to install, build, test and contribute to the framework.
 
+- [Architecture](#architecture)
 - [Requirements](#requirements)
 - [Installation](#installation)
 - [Testing](#testing)
+- [Editor Configurations](#editor-configurations)
 - [Git Workflow](#git-workflow)
+- [Metadata Registry](#metadata-registry)
+- [The e2e fixture's API version is frozen](#the-e2e-fixtures-api-version-is-frozen)
+- [CLI parameters convention](#cli-parameters-convention)
+- [Testing the plugin from a pull request](#testing-the-plugin-from-a-pull-request)
+
+## Architecture
+
+Before diving into the code, read [DESIGN.md](DESIGN.md) for a full architecture reference covering the pipeline stages, handler hierarchy, post-processor chain, error handling strategy, and extensibility points.
 
 ## Requirements
 
@@ -28,93 +38,318 @@ This will install all the tools needed to contribute
 npm install
 ```
 
+### Dependency policy
+
+This repository is kept aligned with its three sibling plugins (`sfdx-git-delta`,
+`apex-mutation-testing`, `sf-git-merge-driver`, `dataset-loader`), so the rules below are
+identical in all four.
+
+- **Every dependency is pinned exactly** — runtime and dev alike. No `^`, no `~`, no ranges.
+  A range in a runtime dependency becomes non-determinism for consumers, and a range in a dev
+  dependency becomes drift between the four repositories.
+- **`.npmrc` sets `save-exact=true`**, so `npm install <package>` records an exact version by
+  default. This is the only mechanism enforcing the rule — keep the file. `save-exact` cannot
+  be expressed in `package.json`: npm reads it from `.npmrc` or the `npm_config_save_exact`
+  environment variable, and `publishConfig` applies at publish time only.
+- **Pins track current latest.** Dependabot moves them; its `versioning-strategy: increase`
+  raises a pinned requirement in place rather than widening it, so grouped updates stay exact.
+- **npm 12 is required** (`engines.npm: ">=12"`), and **no shrinkwrap is shipped**. npm 12
+  excludes `npm-shrinkwrap.json` from `npm pack` even when it is listed in `files`, silently
+  and with exit 0, so the mechanism is inert rather than merely unused.
+- **There is deliberately no lint for this.** `npm outdated` runs as a blocking check in CI
+  and catches a pin that has fallen behind latest, but it cannot see a range that still
+  resolves to latest. Adding a hand-edited range is caught in review, not by tooling.
+
+What the pinning does and does not buy: it caps only the direct dependencies a consumer
+resolves. The transitive majority still floats, and capping those would mean declaring the
+whole chain directly.
+
 ### 3) Build application
 
 ```bash
-npm pack
+npm run build
 ```
 
-Rebuild every time you made a change in the source and you need to test locally
+Rebuild every time you make a change in the source and need to test locally.
 
 ## Testing
 
-### Unit Testing sgd
+The test suite is organized into five buckets, each backed by its own
+directory and its own `npm` script. CI splits them across two build jobs:
+a `quality` job runs the platform-independent gates once on ubuntu (lint,
+build, unit with coverage), while a `platform` matrix job replays the
+platform-sensitive buckets (integration, NUT, functional, then the E2E
+suite) on every supported os (ubuntu, macos, windows) × Node (22, 24, 26)
+pair. Locally, `npm test` aggregates all four non-perf buckets.
 
-When developing, use [jest](https://jestjs.io/en/) unit testing to provide test coverage for new functionality. To run the jest tests use the following command from the root directory:
+| Bucket          | Directory                                  | Vitest config                       | npm script             |
+| --------------- | ------------------------------------------ | ----------------------------------- | ---------------------- |
+| Unit            | `__tests__/unit/`                          | `vitest.config.ts`                  | `npm run test:unit`    |
+| Integration     | `__tests__/integration/`                   | `vitest.integration.config.ts`      | `npm run test:integration` |
+| NUT             | `__tests__/nut/` (`*.nut.ts`)              | `vitest.nut.config.ts`              | `npm run test:nut`     |
+| Functional      | `__tests__/functional/byteEquality/`       | `vitest.functional.config.ts`       | `npm run test:functional` |
+| Performance     | `__tests__/perf/`                          | `vitest.config.perf.ts`             | `npm run test:perf`    |
+
+E2E tests live on dedicated git branches and are run separately — see the
+**E2E Testing** section below.
+
+### Unit Testing
+
+Unit tests live in `__tests__/unit/` and are the only bucket whose vitest
+config enforces 100% line / branch / function / statement coverage.
 
 ```bash
-# just run test
 npm run test:unit
 ```
 
-To execute a particular test, use the following command:
+To run a particular file:
 
 ```bash
 npm run test:unit -- <path_to_test>
-
 ```
 
-### NUT Testing sgd
+### Integration Testing
 
-When developing, use mocha testing to provide NUT functional test. To run the mocha tests use the following command from the root directory:
+Integration tests live in `__tests__/integration/`. They exercise broader
+slices of the pipeline (e.g. SDR registry adapters, TypeHandlerFactory)
+and run without coverage.
 
 ```bash
-# run test
+npm run test:integration
+```
+
+Integration tests must not depend on network reachability, and the bucket enforces
+it rather than asking for it: `vitest.integration.config.ts` routes every
+proxy-honouring HTTPS client through a proxy nothing listens on, and
+`__tests__/integration/networkIsolation.test.ts` fails if that stops being true.
+`npm run test:integration` is therefore the offline check, locally and in CI; the
+config file is part of wireit's fingerprint, so a run skipped as fresh replays one
+that was itself offline. A test that genuinely needs the network does not belong in
+this bucket.
+
+### NUT Testing
+
+NUT tests (Salesforce CLI plugin testkit) live in `__tests__/nut/` as
+`*.nut.ts` files. They drive the packaged CLI through the testkit
+runner.
+
+```bash
 npm run test:nut
 ```
 
-### E2E Testing sgd
+### Functional Testing
 
-SGD has E2E executed at the PR level.
-Those test are located in the branch `e2e/base` and `e2e/head`
-Base scenario are implemented in `e2e/base` branch
-Updates to the metadata are implemented in `e2e/head`
+Functional tests live in `__tests__/functional/byteEquality/`. Each
+fixture directory holds `from.xml` + `to.xml`, a hand-authored
+`expected.json` sidecar, and — only when the pipeline emits a delta
+file for that fixture — an `expected.xml` snapshot.
 
-To run the E2E test locally, clone the repository in another folder and checkout the branch `e2e/head`
+`expected.json` declares the fixture's expected `hasPackageContent`
+flag and its `added` / `modified` / `deleted` manifests as
+`{ type, member }` entries. It is required: a fixture without one
+fails.
+
+`expected.xml` must exist exactly when a writer fires for that
+fixture. Both mismatch directions fail the test, so a stale snapshot
+can never silently stop being compared, and a writer can never
+silently start or stop firing unnoticed.
+
+```bash
+npm run test:functional
+```
+
+To regenerate fixtures after intentional output-format changes:
+
+```bash
+UPDATE_BYTE_EQUALITY_SNAPSHOTS=1 npm run test:functional
+```
+
+This regenerates `expected.xml` only. It never writes or repairs
+`expected.json`, never bypasses the missing-sidecar failure, and never
+deletes a stale snapshot — a human deletes that after reading the
+failure message. A self-regenerating expectation cannot catch a wrong
+`hasPackageContent`: the sidecar declares intent, the snapshot records
+format, and only format is safe to regenerate.
+
+### Performance Testing
+
+Performance benchmarks live in `__tests__/perf/`. Each bench is a vitest
+test that calls the `bench` fixture through
+`__tests__/perf/harness/perfBench.ts`, which pins the sample budget
+(`time: 1000`, `iterations: 64`, `warmupTime: 250`, `warmupIterations: 16`).
+`perfBench(name, fn, hooks?)` takes its hooks as one named object —
+`{ beforeEach?, afterRun? }` — never positionally. `beforeEach` runs before
+every iteration, warmup included, outside the timed window, so it is the
+place to build a sample's inputs (or a per-iteration cold registry) without
+that setup counting toward the measured cost; `afterRun` runs once after
+every sample is in, for a budget assertion over the whole run.
+`__tests__/perf/perfReporter.ts` writes `perf-runtime.json`
+(`{name, unit: 'ops/sec', value: round(1000 / latency.mean), range: '±rme%'}`)
+and `perf-memory.json` (`{name, unit: 'ms', value: latency.mean to 4 dp,
+range}` — despite the name it carries mean latency, kept because it is the
+`dev/bench/memory` gh-pages series id). Both arrays hold the same entries in
+the same order (file path byte order, then registration order).
+
+Benches that carry a cost budget assert on the **mean over the run**, not on
+each sample. A per-sample assertion is a max-over-N: raising the sample budget
+raises the breach rate even though nothing got slower, and a single tail draw
+then discards all 50 series for that commit.
+
+The `name` is the `bench()` registration name and the join key for
+`compareBaseline.mjs`, `preview.mjs` and the gh-pages history, so renaming a
+bench orphans its history, and is reported under *Benchmarks missing from
+this run*. A throwing bench body fails the run and nothing is written; a
+`-t` filter writes partial files.
+
+Benches import the tsc-compiled `lib/`, never `src/`, and run under Node's
+native loader (`experimental.viteModuleRunner: false` in
+`vitest.config.perf.ts`), so a number measures sgd rather than Vite's export
+getters. `npm run test:perf` builds `lib/` and type-checks the perf tree
+first; running `vitest bench --config vitest.config.perf.ts` directly
+benches whatever `lib/` is on disk, stale or missing. Under the native
+loader, imports between perf files use the real `.ts` extension, type-only
+imports are marked `type`, and enums, namespaces and parameter properties
+are unavailable. `__tests__/perf/tsconfig.json` (run by `npm run
+lint:types`) enforces all of this except a `.js` extension on a `.ts`
+sibling, which fails the run at module load instead.
+
+```bash
+npm run test:perf
+```
+
+`test:perf` deliberately declares **no** wireit `files` array, so it is never
+fingerprinted and always executes. Wireit caches a script only when both `files`
+and `output` are declared, and a benchmark must not be cached: its result depends
+on the machine and the moment, not only on its inputs. With `files` present, CI
+restored `perf-runtime.json`/`perf-memory.json` for *both* sides of a pull request
+comparison and reported a full regression table having run nothing — the comment
+still labelled "(same runner)" while comparing two machines. `build` remains cached,
+because a build output genuinely is a function of its inputs. Do not add `files` back.
+
+### Mutation Testing
+
+Mutation testing runs via Stryker against the unit-test bucket. The
+configured thresholds are `break: 90`, `low: 90`, `high: 95`. The CI job
+is opt-in via the `mutation-testing` label and advisory
+(`continue-on-error: true`) — a low score never blocks a PR, but a run
+that executes no tests against a covered mutant is reported as an
+**error**, never as a score: a runner defect must not be mistaken for a
+regression.
+
+```bash
+npm run test:mutation              # full run (~6 min)
+npm run test:mutation:incremental  # only files changed vs origin/main
+```
+
+When a mutant survives:
+
+- **If it is killable**, prefer adding a test assertion. The existing
+  test surface intentionally avoids log-content assertions, so
+  observability-only mutants on lazy `Logger.debug(...)` calls are
+  documented as equivalent rather than killed via log spies.
+- **If it is equivalent or unreachable in practice**, document it
+  inline with `// Stryker disable next-line <Mutator,...> -- equivalent: <why>`
+  (or a `// Stryker disable … // Stryker restore` block when a single
+  next-line directive cannot attach — e.g. multi-line literals). Each
+  rationale should reference the upstream guarantee or test fixture
+  that makes the mutant unobservable.
+- **Pure-constant modules** (e.g. `src/constant/libConstant.ts`) are
+  excluded from `mutate` in `stryker.conf.mjs` because perTest with
+  `ignoreStatic: true` cannot kill module-level const-binding mutants.
+- A small set of `} catch {` / `} finally {` BlockStatement mutants
+  cannot be disabled inline due to biome's brace style. They are
+  enumerated in the `reporters` comment in `stryker.conf.mjs`.
+
+### E2E Testing
+
+SGD has E2E tests executed at the PR level.
+Those tests are located in the branches `e2e/base` and `e2e/head`.
+Base scenarios are implemented in the `e2e/base` branch.
+Updates to the metadata are implemented in `e2e/head`.
+
+To run the E2E tests locally, clone the repository in another folder and checkout the branch `e2e/head`.
+If your own checkout also has local branches named `e2e/base` or `e2e/head` (for example a worktree of this same repository), those are decoys: the E2E commands only ever read the branches inside the cloned folder, so always run git commands there with `git -C e2e …` and compare against `git -C e2e ls-remote origin` before trusting what a ref points to.
+The fixture's `<version>` is frozen (see [The e2e fixture's API version is frozen](#the-e2e-fixtures-api-version-is-frozen)); a red local `validate` is far more often a stale local `e2e/*` ref than a real regression.
 Then execute:
 
 ```bash
 # remove expected content
 npm run clean
-# run the test
-sf sgd source delta --from "e2e/base" --to "e2e/head" --output "expected" --generate-delta
+# run the test — prefer the package script, which already carries every flag
+npm run test:e2e:local
 # check expected is back to normal
-npm run test:e2e
+npm run validate
 ```
 
-Note: you may want to execute the local plugin using `node` if you have not linked the folder used to develop locally with the plugin.
+Run it through the package script rather than by hand. The scripts in
+`e2e/package.json` carry flags the baseline depends on — in particular
+`--source-dir test`, which keeps the committed `expected/` tree out of the diff
+model rather than filtering it back out afterwards. Invoking the CLI directly
+without that flag regenerates `expected/` from a diff that contains `expected/`
+itself, and the copy it produces is what `npm run validate` then fails on. The
+equivalent long form, if you do need to run it by hand:
+
 ```bash
-node path/to/sfdx-git-delta/bin/run sgd:source:delta --from "e2e/base" --to "e2e/head" --output "expected" -d
+sf sgd source delta --from "e2e/base" --to "e2e/head" --output-dir "expected" \
+  --generate-delta --repo-dir . --source-dir test \
+  --include-file .sgdinclude --include-destructive-file .sgdincludeDestructive \
+  --ignore-file .sgdignore --ignore-destructive-file .sgdignoreDestructive \
+  --ignore-whitespace --api-version 67.0
+```
+
+`e2e/.sgdignore` keeps its `/expected` line on purpose: `--source-dir test` is what scopes the diff away from the baseline, and the ignore line stays as live `--ignore-file` coverage against a real, populated directory, so do not delete it as redundant.
+
+Note: you may want to execute the local plugin using `node` if you have not linked the folder used to develop locally with the plugin.
+
+```bash
+node path/to/sfdx-git-delta/bin/run.js sgd source delta --from "e2e/base" --to "e2e/head" \
+  --output-dir "expected" --generate-delta --repo-dir . --source-dir test --api-version 67.0
 ```
 
 ## Editor Configurations
 
 Configure your editor to use our lint and code style rules.
 
-### Code formatting
+### Code formatting and linting
 
-[Biome](https://biomejs.dev/) Format, lint, and more in a fraction of a second.
+[Biome](https://biomejs.dev/) handles both formatting and linting.
 
-### Code linting
+```bash
+npm run lint      # check for issues
+npm run lint:fix  # auto-fix issues
+```
 
-[Biome](https://biomejs.dev/) Format, lint, and more in a fraction of a second.
+`npm run lint` also type-checks the two directories the published build does not
+compile. `tooling/` and `__tests__/` each carry their own `tsconfig.json` project,
+run together by `lint:types`:
+
+```bash
+npx tsc -p tooling     # tooling scripts, plus the src modules they import
+npx tsc -p __tests__   # the whole test tree
+```
+
+Biome has no `noPropertyAccessFromIndexSignature` equivalent, so linting these
+directories is not the same as type-checking them — errors in either will fail
+`npm run lint` and every task that depends on it.
 
 ### Commit linting
 
 This repository uses [Commitlint](https://github.com/conventional-changelog/commitlint) to check our commit convention.
 We follow the [angular](https://github.com/conventional-changelog/commitlint/tree/master/@commitlint/config-angular) commit convention.
-Pre-commit git hook using husky and pull request check both the commit convention for each commit in a branch.
+Pre-commit git hooks using husky and pull request checks both validate the commit convention for each commit in a branch.
 
-You can use an interactive command line to help you create supported commit message
+You can use an interactive command line to help you create supported commit messages:
 
 ```bash
 npm run commit
 ```
+
 ### PR linting
 
 When a PR is ready for merge we use the PR name to create the squash and merge commit message.
-We use the commit convention to auto-generate the content and the type of each release
-It needs to follow our commit lint convention and it will be check at the PR level
+We use the commit convention to auto-generate the content and the type of each release.
+It needs to follow our commit lint convention and it will be checked at the PR level.
+
 ## Git Workflow
 
 The process of submitting a pull request is straightforward and
@@ -156,7 +391,7 @@ git commit ...
 git push origin feature/<name-of-the-feature>
 ```
 
-Commit your changes using a descriptive commit message
+Commit your changes using a descriptive commit message.
 
 The above commands will commit the files into your feature branch. You can keep
 pushing new changes into the same branch until you are ready to create a pull
@@ -165,7 +400,7 @@ request.
 ### Rebase
 
 Sometimes your feature branch will get stale on the main branch,
-and it will must a rebase. Do not use the github UI rebase to keep your commits signed. The following steps can help:
+and it will need a rebase. Do not use the GitHub UI rebase to keep your commits signed. The following steps can help:
 
 ```bash
 git checkout main
@@ -173,6 +408,7 @@ git pull upstream main
 git checkout feature/<name-of-the-feature>
 git rebase upstream/main
 ```
+
 _note: If no conflicts arise, these commands will apply your changes on top of the main branch. Resolve any conflicts._
 
 ### Check your submission
@@ -187,24 +423,25 @@ The above command may display lint issues not related to your changes.
 The recommended way to avoid lint issues is to [configure your
 editor](https://biomejs.dev/guides/integrate-in-vcs/) to warn you in real time as you edit the file.
 
-the plugin lint all those things :
-- typescript files
-- folder structure
-- plugin parameters
-- plugin output
-- dependencies
-- dead code / configuration
+The plugin lints all of the following:
+- TypeScript files
+- Folder structure
+- Plugin parameters
+- Plugin output
+- Dependencies
+- Dead code / configuration
 
 Fixing all existing lint issues is a tedious task so please pitch in by fixing
 the ones related to the files you make changes to!
+
 #### Run tests
 
-Test your change by running the unit tests and integration tests. Instructions [here](#testing).
+Test your change by running the unit tests and integration tests. See [testing instructions](#testing).
 
 ### Create a pull request
 
 If you've never created a pull request before, follow [these
-instructions](https://help.github.com/articles/creating-a-pull-request/). Pull request samples [here](https://github.com/scolladon/sfdx-git-delta/pulls)
+instructions](https://help.github.com/articles/creating-a-pull-request/). See [pull request samples](https://github.com/scolladon/sfdx-git-delta/pulls) for reference.
 
 ### Update the pull request
 
@@ -215,32 +452,83 @@ git rebase origin/${base_branch}
 # Then force push it
 git push origin ${feature_branch} --force-with-lease
 ```
+
 _note: If your pull request needs more changes, keep working on your feature branch as described above._
 
-CI validates prettifying, linting and tests
+CI validates formatting, linting and unit tests once on ubuntu (`quality`
+job), and runs the platform-sensitive test buckets on an os × node matrix
+(`platform` job).
 
 ### Collaborate on the pull request
 
 We use [Conventional Comments](https://conventionalcomments.org/) to ensure every comment expresses the intention and is easy to understand.
 Pull Request comments are not enforced, it is more a way to help the reviewers and contributors to collaborate on the pull request.
 
-## Update Salesforce API version
+## Metadata Registry
 
-The repo contains a script to increment the Salesforce API version supported by SGD.
-To upgrade the API version, run the following command:
+SGD uses a layered metadata registry system to know which Salesforce metadata types exist and how to handle them.
+
+### Registry layers (by priority)
+
+1. **Internal registry** (`src/metadata/internalRegistry.ts`) — highest priority. Contains types that need special handling (Profile children, Translations children, virtual aggregate types) and SDR gap-fillers for types not yet in SDR.
+2. **SDR registry** (`@salesforce/source-deploy-retrieve`) — the Salesforce-maintained registry of metadata types.
+3. **Additional metadata registry** (user-provided) — lowest priority. Users can supply extra type definitions via the `--additional-metadata-registry` flag.
+
+### SDR gap-fillers
+
+Some metadata types exist in Salesforce but are not yet covered by SDR. These are added to the internal registry as "gap-fillers" with `directoryName` and `suffix` fields but no special handling fields (`xmlTag`, `key`, `content`, etc.).
+
+Gap-fillers are automatically removable: when SDR adds native support for a type, tooling detects the overlap and removes the gap-filler entry.
+
+### Coverage check and sync tooling
+
+A script in `tooling/` keeps the internal registry clean:
 
 ```bash
-npm run increment:apiversion
+# Sync internal registry: removes auto-removable gap-fillers that SDR now covers
+npm run sync:registry
 ```
+
+The sync runs on every pull request in the `quality` CI job, which fails if the
+script cannot run or if it leaves `internalRegistry.ts` modified. It also runs
+unattended when dependabot upgrades the SDR dependency, where it gates the
+`feat(metadata)` retitle. `dependabot-auto-merge.yml` then builds the bumped
+commit with the pull-request build (quality and every platform leg, e2e
+included) and squash-merges only when that build is green; re-running a failed
+leg re-runs the merge too.
+
+## The e2e fixture's API version is frozen
+
+The e2e baseline pins Salesforce API version `67.0`: in the three `<version>` tags under
+`expected/` on the `e2e/head` branch, and in the `--api-version 67.0` flag carried
+identically by both scripts in `e2e/package.json`. Nothing recomputes either copy.
+
+This fixture asserts sgd's diff behaviour, not Salesforce's current API version, so the
+calendar advancing is not a reason to bump it. The only trigger that should reopen this
+decision is sgd's output becoming genuinely version-dependent.
 
 ## CLI parameters convention
 
-The plugins uses [sf cli parameters convention](https://github.com/salesforcecli/cli/wiki/Design-Guidelines-Flags) to define parameters for the CLI.
+The plugin uses [sf CLI parameters convention](https://github.com/salesforcecli/cli/wiki/Design-Guidelines-Flags) to define parameters for the CLI.
 
 ## Testing the plugin from a pull request
 
+Every push that changes a non-Markdown file publishes an immutable preview build to [pkg.pr.new](https://pkg.pr.new). Previews are addressed by commit, not by pull request: each such push produces a new URL, so re-read the install command instead of re-running the one from a previous commit. There is no cleanup step on close — previews are immutable and expire upstream on their own. Markdown-only pushes and Dependabot pull requests publish no preview, so the latest command may point at an earlier commit.
+
+A preview URL sits under this repository's path but is built from the pull request's own code. Until a maintainer has reviewed that pull request, treat an installed preview as untrusted third-party code.
+
 To test SGD as a Salesforce CLI plugin from a pending pull request:
 
-1. locate the comment with the beta version published in the pull request
-2. install the beta version `sf plugins install sfdx-git-delta@<beta-channel>`
-3. test the plugin!
+1. Find the install command in the `github-actions[bot]` comment on the pull request.
+2. Run the command — it looks like:
+
+   ```sh
+   sf plugins install https://pkg.pr.new/sfdx-git-delta@abc1234
+   ```
+
+3. Test the plugin!
+
+The comment is posted only for pull requests from a branch of this repository. A fork's
+token is read-only, so no comment is posted there — the preview is still published and the
+e2e matrix still runs against it, and the URL can be read from the `preview` job's log.
+

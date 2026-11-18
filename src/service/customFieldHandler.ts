@@ -1,18 +1,26 @@
 'use strict'
 import { MASTER_DETAIL_TAG } from '../constant/metadataConstants.js'
-import { readPathFromGit } from '../utils/fsHelper.js'
+import type { HandlerResult } from '../types/handlerResult.js'
+import { contentIncludes } from '../utils/fsHelper.js'
 
 import DecomposedHandler from './decomposedHandler.js'
+import StandardHandler from './standardHandler.js'
 
 export default class CustomFieldHandler extends DecomposedHandler {
-  // QUESTION: Why we need to add parent object for Master Detail field ? https://help.salesforce.com/s/articleView?id=000386883&type=1
-  protected override async _copyParent() {
-    const data = await readPathFromGit(
-      { path: this.line, oid: this.config.to },
+  public override async collectAddition(): Promise<HandlerResult> {
+    const result = await StandardHandler.prototype.collectAddition.call(this)
+    if (!this._shouldCollectCopies()) return result
+    // RATIONALE: Why include parent object when deploying Master Detail fields?
+    // Master Detail fields require their parent object to exist; deployment fails otherwise.
+    // See: https://github.com/scolladon/sfdx-git-delta/wiki/Metadata-Specificities#master-detail-fields
+    const isMasterDetail = await contentIncludes(
+      MASTER_DETAIL_TAG,
+      this.element.basePath,
       this.config
     )
-    if (!data.includes(MASTER_DETAIL_TAG)) return
-
-    await super._copyParent()
+    if (!isMasterDetail) return result
+    const copies = [...result.copies]
+    this._collectParentCopies(copies)
+    return { ...result, copies }
   }
 }

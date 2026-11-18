@@ -1,41 +1,49 @@
 'use strict'
 import { join, parse } from 'node:path/posix'
-
 import { METAFILE_SUFFIX } from '../constant/metadataConstants.js'
-import { MetadataRepository } from '../metadata/MetadataRepository.js'
-import { getSharedFolderMetadata } from '../metadata/metadataManager.js'
-import { Metadata } from '../types/metadata.js'
-import type { Manifest, Work } from '../types/work.js'
-import { fillPackageWithParameter } from '../utils/packageHelper.js'
+import type { HandlerResult } from '../types/handlerResult.js'
+import { emptyResult } from '../types/handlerResult.js'
+import type { RunContext } from '../types/runContext.js'
+import type { MetadataElement } from '../utils/metadataElement.js'
 
 import StandardHandler from './standardHandler.js'
 
 export default class SharedFolderHandler extends StandardHandler {
-  /* jscpd:ignore-start */
-  protected readonly sharedFolderMetadata: Map<string, string>
+  protected readonly resolvedType: string | undefined
 
-  constructor(
-    line: string,
-    metadataDef: Metadata,
-    work: Work,
-    metadata: MetadataRepository
-  ) {
-    super(line, metadataDef, work, metadata)
-    this.sharedFolderMetadata = getSharedFolderMetadata(this.metadata)
+  constructor(changeType: string, element: MetadataElement, ctx: RunContext) {
+    super(changeType, element, ctx)
+    this.resolvedType = element.getSharedFolderMetadata().get(element.extension)
   }
-  /* jscpd:ignore-end */
 
-  protected override _fillPackage(store: Manifest) {
-    const type = this.sharedFolderMetadata.get(this.ext!) as string
-    fillPackageWithParameter({
-      store,
-      type: type,
+  public override getElementDescriptor(): { type: string; member: string } {
+    // Stryker disable ConditionalExpression,BlockStatement,StringLiteral -- equivalent: TypeHandlerFactory routes by extension via SharedFolderMetadata, so a handler instantiated as SharedFolderHandler always has a known extension; resolvedType being undefined is unreachable in practice
+    /* v8 ignore next 5 -- defensive: see stryker disable comment above */
+    if (!this.resolvedType) {
+      throw new Error(
+        `SharedFolderHandler: resolvedType is missing for ${this.element.fullPath}`
+      )
+    }
+    // Stryker restore ConditionalExpression,BlockStatement,StringLiteral
+    return {
+      type: this.resolvedType,
       member: this._getElementName(),
-    })
+    }
+  }
+
+  public override async collectAddition(): Promise<HandlerResult> {
+    if (!this.resolvedType) return emptyResult()
+    return await super.collectAddition()
+  }
+
+  public override async collectDeletion(): Promise<HandlerResult> {
+    if (!this.resolvedType) return emptyResult()
+    return await super.collectDeletion()
   }
 
   protected override _isProcessable() {
-    return super._isProcessable() || this.sharedFolderMetadata.has(this.ext)
+    // Stryker disable next-line ConditionalExpression -- equivalent: this falls back to resolvedType when super's check fails; flipping to true would always process, but TypeHandlerFactory routing ensures this handler is selected only for resolvable types where resolvedType is populated, so super._isProcessable() is the dominant arm and the OR-fallback is mostly defensive
+    return super._isProcessable() || !!this.resolvedType
   }
 
   protected override _getMetaTypeFilePath(path: string) {

@@ -1,0 +1,702 @@
+# SFDX-Git-Delta — Design Document
+
+This document describes the internal architecture of SGD for contributors and maintainers. It follows the execution pipeline from CLI invocation to output generation.
+
+## Pipeline Overview
+
+SGD processes git diffs through a linear pipeline with six stages:
+
+```mermaid
+flowchart TD
+    CLI["CLI Command<br/>(delta.ts)"] --> V["1. Config Validation<br/>(ConfigValidator)"]
+    V --> M["2. Metadata Registry<br/>(MetadataRepository)"]
+    M --> G["3. Git Diff Collection<br/>(RepoGitDiff)"]
+    G --> I["4. Diff Interpretation<br/>(DiffLineInterpreter → Handlers)"]
+    I --> P["5. Post-Processing<br/>(PostProcessorManager)"]
+    P --> IO["6. I/O Execution<br/>(IOExecutor + PackageGenerator)"]
+
+    style CLI fill:#e1f5fe
+    style IO fill:#e8f5e9
+```
+
+The pipeline is orchestrated by `src/main.ts`, which receives a `Config` object and returns a `Work` result containing the folded manifests and warnings.
+
+Key design principle: **collection is separated from execution, and handlers are pure**. Each handler's `collect()` is a function of its `(changeType, element, config)` construction inputs alone: it returns a flat `HandlerResult` (`elements`, `copies`, `warnings`) and holds no reference to anything another handler or the orchestrator can see. `DiffLineInterpreter.process()` owns the only accumulator — it folds every handler's returned elements into three orchestrator-local arrays as handlers complete, then hands the folded result to `assembleChanges()` (`src/utils/changesAssembly.ts`), which builds the single `ChangeSet` read model the rest of the pipeline consumes. Nothing is written to disk until `IOExecutor` runs at stage 6, after collectors have folded their own contributions in. This separation enables deduplication and conflict resolution before any I/O occurs, and lets the diff stream be consumed as it arrives from git rather than buffered up front — `RepoGitDiff.getLines()` returns an `AsyncGenerator<string>` that handlers begin draining while git is still emitting.
+
+---
+
+## Stage 1: Config Validation
+
+**Entry**: `ConfigValidator.validateConfig()` (`src/utils/configValidator.ts`)
+
+Validates and normalizes user inputs:
+
+- Resolves each of `--from`/`--to` to the commit it peels to (`git rev-parse --verify <ref>^{commit}` semantics, `GitAdapter.resolveCommit`): symbolic refs resolve, annotated tags are followed through their chain to the tagged commit, and that commit's full SHA is written back to `config.from`/`config.to`
+- Rejects a revision that resolves but does not peel to a commit (`HEAD^{tree}`, `HEAD:path`, a bare tree or blob oid, a tag pointing at a tree) with `error.ParameterIsNotCommit`, naming the flag and the value as typed; an unresolvable revision keeps `error.ParameterIsNotGitSHA` and its fetch-depth hint, which is the right advice only when the object is genuinely missing
+- Validates both flags identically, before the merge-base lookup, the diff and any tree walk
+- When `--merge-base` is set, resolves `from` to the merge base of `from` and `to` (git three-dot semantics) and rewrites `config.from` in place. This step runs **after** SHA validation/resolution, deliberately: a typo in either ref still surfaces as the precise `ParameterIsNotGitSHA` message (with its fetch-depth hint) instead of the vaguer `MergeBaseNotFound`, and the merge-base lookup itself runs against already-resolved SHAs. No common ancestor (`undefined`) throws `MergeBaseNotFound`, naming the refs the user typed rather than the resolved hashes
+- Resolves `apiVersion`. A version passed in (`--api-version`, `SF_ORG_API_VERSION`, or a library caller's `apiVersion`, which is parsed the way the flag is) counts only if it is a positive version; without one, `sourceApiVersion` from the `sfdx-project.json` committed at `--to` is used, under the same rule. It is read through git at that revision (`GitAdapter.getRootFileContent`), never from the working tree and never from a parent directory; an absent file falls back to the latest-version lookup. A file that cannot be read at `--to` (`SfdxProjectReadError`) or is invalid (`SfdxProjectError`) refuses the run with `error.SfdxProjectUnusable`, naming the revision as typed and the cause, before any network call. A pinned version is emitted as pinned and never looked up, so the manifest does not depend on network reachability. Only an unpinned run looks the latest version up, through a live call to the appexchange org, and defaults to it with `warning.ApiVersionDefaulted`; when that call fails (offline/firewalled) or answers with something that is not a positive version, a `ConfigError` advises supplying one and names the cause (connection refused, timed out, DNS, or the unusable value), with any credentials in an echoed proxy URL or PAC proxy entry redacted
+- Sanitizes file paths (output dir, source dirs, ignore files)
+
+Fatal errors (`ConfigError`) at this stage abort the pipeline entirely. An unresolvable API version is reported in the same error as any invalid `--from`/`--to`, repository or `--changes-manifest` problem, after them. The `sfdx-project.json` refusal is the exception: it is reported only when there is no input error, because a bad `--to` or a missing `.git` fails the same read and the input error already names it. This is one of only two places where exceptions propagate to the CLI layer.
+
+---
+
+## Stage 2: Metadata Registry
+
+**Entry**: `getDefinition(config)` (`src/metadata/metadataManager.ts`)
+
+Builds a `MetadataRepository` — the central lookup table mapping file paths to Salesforce metadata type definitions.
+
+### Registry Priority Chain
+
+```mermaid
+flowchart LR
+    SDR["@salesforce/source-deploy-retrieve<br/>registry"] --> Merge["MetadataDefinitionMerger"]
+    IR["internalRegistry<br/>(SGD overrides)"] --> Merge
+    AR["additionalMetadataRegistry<br/>(user-provided)"] --> Merge
+    Merge --> Repo["MetadataRepositoryImpl"]
+```
+
+1. **SDR registry** — standard Salesforce metadata types from `@salesforce/source-deploy-retrieve`, adapted via `SdrMetadataAdapter`
+2. **Internal registry** (`src/metadata/internalRegistry.ts`) — SGD-specific overrides and additions (highest priority, overrides SDR by `xmlName`)
+3. **Additional registry** (user-provided via `--additional-metadata-registry`) — custom types, lowest priority
+
+### Multi-Index Lookup
+
+`MetadataRepositoryImpl` maintains three lookup indexes for fast path resolution:
+
+| Index | Key | Use case |
+| ----- | --- | -------- |
+| `extIndex` | File extension (`.cls`, `.trigger`) | Primary lookup for most types |
+| `dirIndex` | Directory name (`classes`, `triggers`) | Fallback when extension is ambiguous — picks deepest match, stops at `inFolder` types, SDR content-container adapters (`bundle`/`digitalExperience`/`mixedContent`), and virtual content-containers (internal-registry types with `metaFile: true` and a non-empty `content[]`: Wave/Bot/Discovery/Moderation) so a nested content folder colliding with a metadata directory name (e.g. an `icons/` folder inside a StaticResource, or a `dashboards/` folder inside `wave/`) cannot override the container type |
+| `xmlNameIndex` | XML name (`ApexClass`, `ApexTrigger`) | Direct lookup by type name, exposed as `getByXmlName(xmlName)` on the interface for handler-resolution and parent-type lookup |
+
+### Key Metadata Fields
+
+| Field | Purpose |
+| ----- | ------- |
+| `xmlName` | Salesforce API type name |
+| `suffix` | File extension without dot |
+| `directoryName` | Expected parent directory |
+| `metaFile` | Whether a companion `-meta.xml` file exists |
+| `inFolder` | Whether the type uses folder-based organization |
+| `content[]` | Sub-types sharing the same directory (Dashboard → DashboardFolder) |
+| `xmlTag` + `key` | In-file diff semantics for sub-element types |
+| `adapter` | SDR `strategies.adapter` value (e.g. `bundle`, `mixedContent`, `digitalExperience`) — drives dynamic handler resolution |
+| `decomposition` | SDR `strategies.decomposition` value (e.g. `folderPerType`) — used for child type handler heuristics |
+| `pruneOnly` | Type is only ever added to destructiveChanges, never package |
+| `excluded` | Sub-element type is not independently packageable |
+
+---
+
+## Stage 3: Git Diff Collection
+
+**Entry**: `RepoGitDiff.getLines()` (`src/utils/repoGitDiff.ts`)
+
+Streams diff lines between the `from` and `to` commits. `getLines()` is an `AsyncGenerator<string>` so RepoGitDiff never buffers the diff into an array. `GitAdapter.streamDiffLines()` is the upstream producer: it makes a single `repo.diff({ from, to, recursive: true, detectRenames, ... })` call against the tsgit facade, then yields sgd's `<STATUS>\t<path>` line shape by iterating the returned `DiffChange[]` through `toDiffLines()`. Rename detection (`detectRenames`) is **gated on `config.changesManifest`** — default sgd runs pass `detectRenames: false` so line shape matches the pre-feature output; setting `--changes-manifest` turns it on. When enabled, `toDiffLines()` yields `R<score>\tfrom\tto` for a rename with both sides in scope (score from `toSimilarityPercent`), degrading to a plain `A` or `D` line when only one side is in scope; `RepoGitDiff._expandRename` then splits `R` lines into synthetic `A`/`D` pairs while recording each `{fromPath, toPath}` pair for `RenameResolver` to resolve later. A second side-channel tracks source-dir coverage the same way: `RepoGitDiff` owns a `DiffScopeVerdict` (`changesSeen`/`linesYielded` counters) as a per-instance field, resetting it at the start of every `getLines()` call and threading it — together with `config.source` — into `GitAdapter.streamDiffLines()` as arguments, rather than letting `GitAdapter` read either off its own (cached, potentially shared) config. Once the diff is fully drained, `RepoGitDiff.getUnmatchedSourceScopes()` (delegating to `GitAdapter.getUnmatchedSourceScopes()`, passed that same verdict and scope list) reports every non-root `config.source` scope, but only when *none* of them matched anything in the drained diff — the check is all-or-nothing rather than per-scope, since a path can satisfy several scopes at once and attributing a match to one specific scope would need bookkeeping that buys nothing; a root scope (`.`) configured alongside non-root scopes suppresses the warning entirely, since it unions with the others and means everything is already in scope. `main.ts` turns a non-empty result into the `warning.SourceDirMatchedNothing` warning.
+
+`toDiffLines()` replicates two subprocess-era filters in one pass over each `DiffChange`: the `--diff-filter=AMD(R)` status filter, and per-side `-- <source>` pathspec scoping via `keepSide`/`inScope`. The latter matches against `config.source`'s canonical literal paths by repository-relative prefix — never a glob or pathspec magic, since only a validated `Pathspec` can ever reach `config.source`. Gitlink (submodule pointer) changes are skipped via the same `keepSide` mode check, and `type-change`/`copy` entries are dropped. Whitespace-only changes are excluded by passing `ignoreWhitespace: 'all'` / `ignoreBlankLines: true` diff-mode options to `repo.diff()` when `config.ignoreWhitespace` is set — one facade call covers both the default and whitespace-ignoring cases; there is no separate code path, no per-filter round trip, and no numstat/`-z` rename-path encoding to parse, since `DiffChange` already carries typed `oldPath`/`newPath` fields.
+
+Per upstream line, `getLines()` then applies four ordered gates:
+
+1. Expands rename lines into synthetic `A`/`D` pairs (capturing the rename-pair side-channel) — every pair git detected is captured here unconditionally; whether it survives to a rename triple is an ignore-file decision made later, in `RenameResolver.resolve()` (see the rename paragraph in the ChangeSet section below), not a filter applied at this stage.
+2. **Registry membership** — filters through the metadata registry; only paths that resolve to a known metadata type are yielded.
+3. **Ignore** (output policy) — applies `IgnoreHelper` (separate global and destructive-only ignore files). A `D` or `M` line the helper rejects is dropped. An `A` line it rejects is **held**, not dropped: it never yields, and it enters the cancellation index below only if, at `to`, the component it resolves to has no file the global ignore would keep — read once at upstream EOF through `GitAdapter.buildTreeIndex(config.to, config.source)`, and only when a held addition shares a key with a deferred deletion. A component that survives solely under ignored paths was moved into the ignore set and its deletions cancel; a component still visible at `to` keeps its deletions, so a stale ignored copy can never suppress a real one. Every deletion cancelled this way is also exposed through `RepoGitDiff.getCancelledDeletions()` (the deleted line and its component key): that side output is the input of the pure-move resolution below. `--ignore-destructive-file` plays no part in that visibility test. A name a kept (non-held) addition already registered is excluded from the read's candidates — its deletion is already cancelled, so the read cannot change the outcome. When the `to` listing itself cannot be read, the read fails closed: every pending candidate counts as visible, nothing vouches, and the deletions yield exactly as they do today; `main.ts` turns that failure into the `warning.IgnoredMoveCheckSkipped` warning.
+4. **Cancellation index** — defers `D` lines until upstream EOF so the rule has the full A-name set. A/M lines yield as they arrive; D lines are buffered and yielded last, dropping any whose key matches an addition's key: the legacy file-move-same-component safety net, keyed on the Salesforce component identity `MetadataRepositoryImpl.getFullyQualifiedName` derives from the path, compared lowercased — not on the raw filename. True component renames (different keys) surface via tsgit's `detectRenames`. Held additions are folded in after the visibility read, before any `D` line is classified.
+
+The key per registry shape:
+
+| shape | key |
+|---|---|
+| plain | `<directoryName>/<basename minus -meta.xml>`; bare basename when the entry declares no `directoryName` |
+| holder-scoped composed (`PermissionSet`, `CustomObjectTranslation`) | the holder folder, e.g. `permissionsets/PS` — every decomposed file collapses onto its holder |
+| other composed (`CustomObject`, `Workflow`, `SharingRules`, the sub-object types) | the path from the first registry directory found anywhere in the path, separators removed, e.g. `objectsAccountfieldsA.field-meta.xml` |
+| `inFolder` (tested **before** the container check, since `Document` is both) | the folder path with `-meta.xml`, a trailing `Folder`, and the extension stripped |
+| content container (`bundle` / `mixedContent` / `digitalExperience`) | the container directory; Digital Experience Bundle depth 2, or depth 4 (page content) when more than 4 segments follow the bundle |
+| nested-content family sharing one flat directory (Wave, Bot, Discovery, Moderation) | extension kept, any sub-directory dropped — except `VirtualBot`, which keeps its folder (`<bot>.<version>`) |
+
+Three ordering constraints hold inside the rule: `inFolder` must be tested before the content-container check, or `Document` (which is both) truncates to its folder and loses its varying extensions; a type that declares nested content (`content[]`) never takes the container rule, since its sub-directories are part of the name, not opaque content; and the extension is stripped for `inFolder` paths but kept for nested-content families, since the latter tell same-directory siblings apart by extension alone.
+
+Two exclusions survive because a path-derived key genuinely cannot bridge them: `IntegrationHubSettingsType`, where two suffixes share one directory and the key (not the descriptor) is the precise side; and `WaveTemplateBundle`, declared under two different type directories that no path-derived key can unify. A further residual collision — `reports/Sales.report-meta.xml` and `reports/Sales.reportFolder-meta.xml` both keying `reports/Sales` — needs a report filed directly under `reports/`, which is not a valid SFDX layout. And a composed key anchors on the *first* registry-directory segment anywhere in the path, so a package root that happens to share a registry directory's name (e.g. `applications/objects/Account/fields/X.field-meta.xml`) drags that root into the key, producing two keys for the one component the descriptor sees — recorded as a residual, not fixed. Separately, an extensionless `inFolder` name ending in `Folder` (e.g. `logoFolder`) is deliberately keyed the same as its extension-bearing sibling, mirroring how `InFolderHandler` itself derives the name.
+
+`src/main.ts` always materializes the stream once into an array: the tree-index scope (`computeTreeIndexScope`, every run without `--include` / `--include-destructive`), the pure-move resolution and `lineProcessor.process` all walk the same lines, and the cancelled deletions the resolution reads exist only once the diff is drained. With an include file the scope is `config.source`, otherwise it is computed from the lines.
+
+### Ignore System
+
+`IgnoreHelper` wraps the `ignore` library (gitignore spec) with a dual-instance pattern:
+
+- **globalIgnore**: applied to all diff lines
+- **destructiveIgnore**: applied only to deletions; falls back to globalIgnore if `--ignore-destructive-file` is not provided; carries user patterns only — no hard-coded pattern is added. The Salesforce API limitation on undeletable types (today `RecordType`) is enforced downstream instead, as a type-level strip in `ChangeSet.forDestructiveManifest()` keyed on `UNDELETABLE_TYPES` (`src/constant/metadataConstants.ts`). That is the one code path every route converges on, including `--include-destructive-file`, which never reaches `RepoGitDiff._routeLine`'s ignore gate at all. One consumer applies it past the line gate: `InFileHandler` checks it (as a synthetic `D\t<path>` line) before emitting the sub-components its `MetadataDiff` found deleted inside a **modified** file — an `M` line the gate only ever matched against globalIgnore. It skips the check on `D` lines: the main diff already filtered those, and the include-destructive pass's must win over the ignore.
+
+The repository's own end-to-end baseline is the live proof of the held-addition ordering: `e2e/expected/` is both sgd's output directory and the committed baseline, and it sits inside the `e2e/base..e2e/head` range under the ignored `/expected` pattern, so every regenerated copy is an ignored addition sharing its key with a component still alive under `test/`. A regeneration that reaches a fixed point — a second run changes nothing — shows those copies did not vouch; a baseline that appears, disappears and reappears across runs is the signature of an ignored copy cancelling a real deletion.
+
+---
+
+## Pure-Move Suppression
+
+**Entry**: `PureMoveResolver.resolve(lines, cancelled)` (`src/utils/pureMoveResolver.ts`), called by `src/main.ts` between the diff collection and the handler pass. The resolver only orchestrates: the component checks live in `src/utils/componentMove.ts`, union triggers in `src/utils/unionTriggers.ts`, union membership in `src/utils/containerUnion.ts`, the per-revision view (project + blob ids) in `src/utils/revisionSide.ts`, and diff-line formatting in `src/utils/gitLine.ts`.
+
+A component moved to another directory shows up in the diff as deletions plus additions of the same component. Stage 3 already pairs them by component key and cancels the deletions; the resolver decides which of those pairs are *pure* moves, in which case the additions are dropped too and the component reaches neither manifest. It returns a `MoveResolution`: the remaining `lines`, the precomputed in-file `unions` and a `skipCause`, the message of the error that stopped the check, or `undefined` when it ran. With no cancelled deletion it returns the lines untouched.
+
+### Component checks
+
+A group (cancelled deletions plus additions sharing a key) is a pure move when all of these hold:
+
+- every file resolves to the same type and member (one handler probe per group);
+- the deleted and added files map one to one by path relative to each side's common directory, with identical blob ids (`GitAdapter.getBlobIds` at each revision);
+- the component is complete: the files moved are exactly the files of the component listed at `from` and at `to` (component indexes built once per revision);
+- the component is in one `sfdx-project.json` package directory, each side resolved against its own revision's project (`loadSfdxProject`; no project at both revisions means one entry);
+- the source is visible to the global ignore (`--ignore-file`): a source under it, or covered only by `--ignore-destructive-file`, is not a move. A destination under the destructive-only ignore is still suppressed; a destination under the global ignore was already held in Stage 3 and emits nothing.
+
+An unusable `sfdx-project.json` or file list throws inside the resolver; `resolve` catches it, logs it at debug level and returns the lines unchanged with `skipCause` set to the error message, which `main.ts` turns into `warning.PureMoveCheckSkipped`, naming that cause. Suppression is then off for the whole run.
+
+### Union entries
+
+In-file containers cannot be judged by blobs: a labels file can change while its labels only moved. The resolver collects a *union* per package directory for those groups:
+
+| Symbol | Meaning |
+| ------ | ------- |
+| `F_add` | from-side files of the union that vouch for an element already existing: kept by the global ignore, except a file deleted in the diff under the destructive-only ignore |
+| `F_del` | from-side files whose elements may be deleted: kept by both ignore files |
+| `S` | to-side files of the union in the entry, whatever the ignore files (a file under the global ignore shields its elements from deletion but emits nothing) |
+
+SDR exposes one `CustomLabels` component per package directory, whatever the file names, so for non-decomposed `CustomLabel` the union spans all the labels files of the entry; for other in-file types it is the file itself. `MetadataDiff.runUnion` diffs the elements of the to-side files against the union of the from-side files: only changed or added elements reach `package.xml`, elements gone from every to-side file reach `destructiveChanges.xml`, and an element merely moved between files of the entry is neither. Moves across entries are not unions: every element deploys. The `--ignore-file` and `--ignore-destructive-file` patterns split the union bases (a file under the global ignore is out of the comparison; the destructive-only ignore filters deletions only), and a labels file whose package directory differs between the revisions is left out. The outcomes are keyed by file path and placed in `RunContext.unions`.
+
+---
+
+## Stage 4: Diff Interpretation & Handler Hierarchy
+
+**Entry**: `DiffLineInterpreter.process(lines)` (`src/service/diffLineInterpreter.ts`)
+
+Each diff line is dispatched to a type-specific handler via an async queue capped at `getConcurrencyThreshold()`. The `TypeHandlerFactory` selects the handler class using a multi-tier resolution chain that combines explicit overrides with dynamic resolution from SDR registry attributes.
+
+### Dispatch Flow
+
+```mermaid
+flowchart TD
+    Line["Diff line<br/>'A force-app/main/.../MyClass.cls'"] --> TF["TypeHandlerFactory"]
+    TF --> ME["MetadataBoundaryResolver<br/>creates MetadataElement"]
+    TF --> T1{"xmlName in<br/>handlerMap?"}
+    T1 -->|Yes| SH["Explicit Handler Override"]
+    T1 -->|No| T2{"inFolder?"}
+    T2 -->|Yes| IF["InFolderHandler"]
+    T2 -->|No| T3{"adapter in<br/>adapterHandlerMap?"}
+    T3 -->|Yes| AH["Adapter-Based Handler"]
+    T3 -->|No| T4{"has parentXmlName?"}
+    T4 -->|Yes| CH["Child Type Heuristics"]
+    T4 -->|No| T5{"parent of<br/>InFile children?"}
+    T5 -->|Yes| IFH["InFileHandler"]
+    T5 -->|No| DH["StandardHandler"]
+    CH --> C["handler.collect()"]
+    SH --> C
+    IF --> C
+    AH --> C
+    IFH --> C
+    DH --> C
+    C --> HR["HandlerResult<br/>{elements, copies, warnings}"]
+```
+
+`DiffLineInterpreter.process()` allocates no shared state up front. Each handler's `collect()` takes no parameter and returns a `HandlerResult` describing only what that handler contributed. The `BoundedQueue` worker folds every returned `elements` / `copies` / `warnings` triple into three orchestrator-owned local arrays via `pushAll` as each handler completes — up to `MAX_PARALLELISM` handlers write concurrently, but each write is a plain array push, so there is no shared object a handler can corrupt. This fold step must itself never throw: `BoundedQueue` treats a worker rejection as fatal to the whole pass, so aggregation is total, side-effect-free array work over results handlers have already caught internally. `process()` returns the folded arrays as one `HandlerResult`.
+
+### Handler Resolution Tiers
+
+The `resolveHandler()` method applies these tiers in order, returning the first match:
+
+| Tier | Signal | Handler | Example |
+| ---- | ------ | ------- | ------- |
+| 1. Explicit override | `xmlName` in `handlerMap` | Varies | `Flow` → `FlowHandler` |
+| 2. Folder-based | `inFolder: true` | `InFolderHandler` | `Document`, `EmailTemplate` |
+| 3. Adapter-based | `adapter` from SDR strategies | `InResourceHandler` / `InBundleHandler` | `bundle` → `InResource` |
+| 4. Child heuristics | `xmlTag` + `key` + non-adapter parent | `DecomposedHandler` | `WorkflowAlert` |
+| 4b. Child heuristics | no `xmlTag` + `folderPerType` parent | `CustomObjectChildHandler` | `ListView` |
+| 5. InFile parent | has children with `xmlTag`+`key` | `InFileHandler` | `Workflow` |
+| 6. Fallback | none of the above | `StandardHandler` | `ApexClass` |
+
+This design means most new SDR metadata types are handled automatically without code changes. Only types requiring specialized behavior need explicit overrides in `handlerMap`.
+
+`MetadataBoundaryResolver` creates a `MetadataElement` — a value object capturing the parsed identity of the diff line: base path, extension, parent folder, component name, and path segments after the type directory. Resolution follows a tiered strategy to minimize git I/O: (1) flat paths (single segment after the type directory) use `MetadataElement.fromPath()` directly; (2) types with no suffix (LWC, Aura) use `fromPath()` since the scan cannot identify them; (3) depth-2 paths where the file contains the metadata suffix extract the component name directly from the file name without git I/O; (4) deeper paths delegate to `scanAndCreateElement()`, which reads `this.trees.filesUnder(revision, typeDir)` — the run-owned `TreeReader` (built once per revision by `GitAdapter.buildTreeIndex`/`flattenTree` and threaded into `MetadataBoundaryResolver` inside the `RunContext` by `main.ts`; see "Git Adapter" below), degrading to an empty result when no index exists for that revision or path — see Tree index below — so the lookup makes zero additional git invocations — then builds a Set of component names from meta files and matches path segments inner-to-outer. This handles intermediate folders between the type directory and the component (e.g., `permissionsets/marketing/Admin/...` where `marketing` is an organizational folder, not the component). For paths where the type directory is not in the path, a fallback walk-up strategy lists directory siblings via `this.trees.children(revision, currentDir)` and matches against known metadata suffixes, with results cached per revision via `dirCache`.
+
+### Handler Hierarchy
+
+```mermaid
+classDiagram
+    class StandardHandler {
+        +collect() HandlerResult
+        +collectAddition() HandlerResult
+        +collectDeletion() HandlerResult
+        +collectModification() HandlerResult
+        #_isProcessable() bool
+        #_getElementName() string
+        #_delegateFileCopy() bool
+    }
+
+    StandardHandler <|-- InFileHandler
+    StandardHandler <|-- InFolderHandler
+    StandardHandler <|-- InResourceHandler
+    StandardHandler <|-- SharedFolderHandler
+    StandardHandler <|-- DecomposedHandler
+    StandardHandler <|-- ContainedDecomposedHandler
+    StandardHandler <|-- ExternalServiceRegistrationHandler
+    StandardHandler <|-- CustomObjectHandler
+    StandardHandler <|-- CustomObjectChildHandler
+    StandardHandler <|-- FlowHandler
+
+    InFileHandler <|-- CustomLabelHandler
+    InFolderHandler <|-- ReportingFolderHandler
+    InResourceHandler <|-- BundleHandler
+    InResourceHandler <|-- LwcHandler
+    InResourceHandler <|-- ObjectTranslationHandler
+    SharedFolderHandler <|-- BotHandler
+    DecomposedHandler <|-- CustomFieldHandler
+```
+
+### StandardHandler — Template Method
+
+`StandardHandler` defines the fixed algorithm skeleton:
+
+1. `_isProcessable()` — gate: does this file match the expected suffix?
+2. Switch on change type → `collectAddition()` / `collectDeletion()` / `collectModification()`
+3. Errors are caught and converted to warnings — a single broken file does not abort processing
+
+Every hook is a pure function of the handler's constructor inputs (`changeType`, `element`, `config`): calling `collect()` twice on the same inputs returns deep-equal results and touches nothing outside the handler instance. A few subclasses set instance-local scratch fields during construction or inside a single `collect()` call (e.g. `InResourceHandler.metadataName`, `ContainedDecomposedHandler.holderFolder`) — that stays single-owner state, not shared state, because a fresh handler instance is created per diff line and `collect()`ed exactly once.
+
+Subclasses override specific hooks to customize behavior. Even thin subclasses that override a single method justify their existence because they are selected at runtime based on metadata type definitions.
+
+### Handler Reference
+
+#### InFileHandler
+
+**Extends**: StandardHandler
+**Used by**: AssignmentRules, AutoResponseRules, EscalationRules, GlobalValueSetTranslation, MarketingAppExtension, MatchingRules, Profile, SharingRules, StandardValueSetTranslation, Translations, Workflow
+
+Handles metadata types where multiple deployable sub-elements are stored in a single XML file. Uses `MetadataDiff` to compare both revisions of the file and produce per-sub-element manifest entries. Copies a pruned XML (computed content) containing only changed sub-elements instead of the full file.
+
+Key behavior:
+- Additions/modifications: XML diff produces fine-grained manifest entries per changed sub-element
+- Deletions: if `pruneOnly` is set, treats as standard deletion; otherwise re-diffs to extract sub-element removals
+- File copy: disabled for standard git-copy; uses computed content (pruned XML) instead
+- Union outcome: when the file is part of a pure-move union, the outcome precomputed in `RunContext.unions` (keyed by path) replaces the per-file `MetadataDiff.run`; the rest of the handler consumes it unchanged
+- Container manifest entry: the container is listed in `package.xml` only when the to-side has a surviving add or modify in any bucket — including registry-excluded children and scalar/unknown tags, neither of which produce their own manifest entry. A diff whose only change is removed keyed or object-fingerprint children lists nothing in `package.xml` and emits no delta file; it produces `destructiveChanges.xml` entries only for children that are not registry-excluded. Whole-bucket subTypes (array/keyless/unknown) are compared wholesale, so removing an element there counts as a modify of the container: it lists the container, emits a pruned delta file and produces no destructive entry
+
+#### CustomLabelHandler
+
+**Extends**: InFileHandler
+**Used by**: CustomLabel
+
+Handles `CustomLabel` which can exist in two formats:
+- **Monolithic**: single `CustomLabels.labels-meta.xml` — uses InFile XML diff behavior
+- **Decomposed**: individual `.label-meta.xml` files — uses StandardHandler behavior directly
+
+Detects the format by file extension and routes accordingly. In the monolithic format a labels file covered by a union reads the precomputed outcome of the whole package directory instead of diffing alone, so labels moved between files are not redeployed.
+
+#### InFolderHandler
+
+**Extends**: StandardHandler
+**Used by**: Document, EmailTemplate (and any type with `inFolder: true` not explicitly overridden)
+
+Handles metadata stored in named folders. When a file changes, the handler also copies the folder's `-meta.xml` descriptor and, under `--generate-delta`, emits one `GitComponentCopy` per changed line whose path is the component path (the base path without its last extension) — `IOExecutor` expands it into every file whose path starts with the component path followed by `.` or `/`, listing each directory once per run however many lines target it — plus a `GitCopy` of a file named exactly as the component (an extensionless content file), when the `to` index holds that path as a file (`fsHelper.fileExists`). The handler reads no directory listing at collect time. A folder descriptor line of a type with meta files (Document, EmailTemplate) therefore also copies the folder's content. Element names use the `Folder/MemberName` format.
+
+#### ReportingFolderHandler
+
+**Extends**: InFolderHandler
+**Used by**: Dashboard, Report
+
+Handles reporting types in shared directories where the actual Salesforce type is determined by file extension. An unrecognized extension silently produces an empty result. The manifest type name comes from the resolved extension, not the directory.
+
+#### SharedFolderHandler
+
+**Extends**: StandardHandler
+**Used by**: VirtualDiscovery, VirtualModeration, VirtualWave
+
+Handles metadata in a shared directory where the type is resolved per file extension. Similar to ReportingFolderHandler but without the folder-meta copy logic.
+
+#### BotHandler
+
+**Extends**: SharedFolderHandler
+**Used by**: VirtualBot
+
+Extends shared folder behavior: changing any sub-file also forces inclusion of the parent `Bot` manifest entry and its `.bot-meta.xml`.
+
+#### InResourceHandler
+
+**Extends**: StandardHandler
+**Used by**: ExperienceBundle, GenAiPlannerBundle, LightningTypeBundle, StaticResource, WaveTemplateBundle (and any type with `adapter: "bundle"` or `adapter: "mixedContent"` not explicitly overridden)
+
+Handles bundle-like resources where changing any file within the bundle triggers the entire bundle to be redeployed. On deletion, checks if the bundle root still has content — if yes, treats as modification instead of deletion (the bundle still exists with remaining files). The check reads the run's `to` index through `fsHelper.pathExists` over `RunContext.trees`, which `main.ts` builds in every mode, so the answer is the same with and without `--generate-delta`. With `--generate-delta` it requests its component once per changed line instead of listing it; the listing happens at I/O time, once per parent directory, however many components it holds. It also copies a file named exactly as the component (an extensionless static resource content file) when the `to` index holds that path as a file (`fsHelper.fileExists`), since the component expansion only reaches paths that continue the component path with `.` or `/`.
+
+#### BundleHandler
+
+**Extends**: InResourceHandler
+**Used by**: DigitalExperienceBundle
+
+Like InResourceHandler but element names use two path segments (`bundleType/bundleName`) instead of one.
+
+For a **page-level** change — a content file inside the canonical
+`<baseType>/<spaceApiName>/<contentType>/<contentApiName>/...` layout (more than four path segments
+after the `digitalExperiences` directory) — it instead emits the fine-grained `DigitalExperience`
+child type (`<baseType>/<spaceApiName>.<contentType>/<contentApiName>`) and scopes the component to
+the content folder. The delete-vs-modify existence check then covers only that page, and the file
+copy ships the full content folder recursively — all core files (`_meta.json`, `content.json`),
+nested device-variant subfolders (`mobile/`, `tablet/`), and any locale/media files — scoped to the
+single content folder. A `DigitalExperience` view deploy replaces the view's full device-version
+set, so absent variant folders would read as deletions and be rejected; the delta must therefore
+carry the whole folder. Shorter paths (the bundle's own `*.digitalExperience-meta.xml`, or any
+non-canonical shallow path) keep the coarse `DigitalExperienceBundle` behaviour. Whole-bundle
+add/delete is collapsed back to a single `DigitalExperienceBundle` member by the bundle-rollup filter
+applied during assembly (see Stage 5).
+
+#### LwcHandler
+
+**Extends**: InResourceHandler
+**Used by**: AuraDefinitionBundle, GenAiFunction, LightningComponentBundle, UIBundle
+
+Like InResourceHandler but skips files directly in the type directory (e.g. top-level `__tests__`); only processes files inside a named component sub-folder. That skip is unchanged. Under `--generate-delta` it also emits one `GitTypeDirCompanionCopy` for its type directory, beside the inherited `GitComponentCopy`.
+
+#### ObjectTranslationHandler
+
+**Extends**: InResourceHandler
+**Used by**: CustomFieldTranslation, CustomObjectTranslation
+
+Field translation files are not independently deployable, so the parent `objectTranslation` file must always accompany its field-translation children in the output. When the parent has its own surviving changes, the handler emits a pruned version containing only the changed field translations as computed content; when it has none (a child-only change), it falls back to copying the whole parent file verbatim at the target revision.
+
+Both layouts SDR resolves to one component are supported: the sub-folder spelling `objectTranslations/Account-fr/Account-fr.objectTranslation-meta.xml`, which also hosts the sibling `fieldTranslation` files, and the flat spelling `objectTranslations/Account-fr.objectTranslation-meta.xml`. **Layout-independence is the invariant here** — the parent file is located by the component name in the changed file's own directory, never by a fixed path position. A positional expression (`pathAfterType[0]` for the member, `parts.at(-2)` for the parent path) reads the file's own base name and the type directory respectively in the flat spelling, which leaks the `.objectTranslation-meta.xml` suffix into the manifest member and resolves the parent to a path that matches nothing — the file then silently never reaches the package. That was the regression in #1198 (v6.32.0 through v7.4.0), fixed in #1408.
+
+Deletion liveness: a deletion under `objectTranslations/` is a modification when `<typeDir>/<component>` still exists at `--to`, and destructive otherwise. The handler overrides `_getMetadataName` to build that anchor from `typeDirectoryPath` and the element name; `componentPath` is not usable because `MetadataBoundaryResolver` anchors a `fieldTranslation` file on the file itself. In the flat layout `<typeDir>/<component>` is never a real tree path, so a flat deletion stays destructive. A deleted parent `objectTranslation` file whose component folder survives is a modification with nothing copied and no warning: SDR rejects that tree at deploy (`TypeInferenceError: Unexpected child metadata`), and sgd does not re-enforce metadata-shape rules.
+
+One parent diff per parent per pass: `_getObjectTranslationWriter` asks `RunContext.parentDiffs` for the parent's outcome keyed by the parent path, so every child of a parent joins the same `MetadataDiff.run` instead of re-reading and re-diffing the parent per child, and all children share the one writer that `IOExecutor` runs once.
+
+#### DecomposedHandler
+
+**Extends**: StandardHandler
+**Used by**: SharingCriteriaRule, SharingGuestRule, SharingOwnerRule, Territory2, Territory2Rule, WorkflowAlert, WorkflowFieldUpdate, WorkflowFlowAction, WorkflowKnowledgePublish, WorkflowOutboundMessage, WorkflowRule, WorkflowSend, WorkflowTask (and any child type with `xmlTag` + `key` whose parent has no adapter)
+
+Handles metadata stored as individual files in sub-folders of a parent type. Element names are qualified as `ParentName.ChildName`. On addition, also copies the parent type's `-meta.xml`.
+
+#### CustomFieldHandler
+
+**Extends**: DecomposedHandler
+**Used by**: CustomField
+
+Like DecomposedHandler but the parent copy is conditional: only copies the parent `CustomObject` when the field contains `<type>MasterDetail</type>`, because Master Detail fields require the parent object in the same deployment. That content check is one `grepUnderPaths` call on the field's own file, an exact hit in the sorted path index.
+
+#### ContainedDecomposedHandler
+
+**Extends**: StandardHandler
+**Used by**: PermissionSet
+
+Handles types that can exist in either monolithic format (single file) or decomposed format (folder with sub-files). Detects the format at construction time. Locates the PermissionSet directory using a fixed offset from the file path's end, supporting arbitrary nesting depth (e.g., `permissionsets/marketing/Admin/fieldPermissions/...`). On deletion in decomposed format, checks if the holder folder still has content — if yes, treats as modification (redeploy the PS); if no, treats as true deletion. The holder check reads the run's `to` index (`fsHelper.readDirs`), built in every mode.
+
+#### ExternalServiceRegistrationHandler
+
+**Extends**: StandardHandler
+**Used by**: ExternalServiceRegistration
+
+Accepts the definition (`<Name>.externalServiceRegistration-meta.xml`) and the decomposed schema (`<Name>.yaml`, written by SDR's `decomposeExternalServiceRegistrationBeta`). `yaml` is not a registered suffix: the schema resolves to the type only because it sits in the `externalServiceRegistrations` directory, so other files there (e.g. `README.md`, `.json`) stay dropped. An add or modify of either file packages `ExternalServiceRegistration[<Name>]`; with `--generate-delta` the changed file is copied together with its sibling when the sibling exists at `--to`, because SDR cannot convert the component from one file alone. A schema deletion while the definition is live at `--to` is packaged (changeKind delete) and the definition is copied — the registration cannot be partially deleted, so it is redeployed. A schema deletion while the definition is absent at `--to` emits nothing: only the definition's own deletion line emits the destructive entry, so a schema deletion can never delete a live registration. A definition deletion is destructive with no liveness read. Liveness reads the run's `to` index (`fsHelper.pathExists`), built in every mode.
+
+#### CustomObjectHandler
+
+**Extends**: StandardHandler
+**Used by**: CustomObject, Territory2Model
+
+On addition, scans the object's `fields/` subfolder for Master Detail fields and includes them in the copy set — Master Detail fields cannot be deployed in a subsequent step. The scan is one `grepUnderPaths` call on the `fields/` directory, a binary-searched range in the sorted path index.
+
+#### CustomObjectChildHandler
+
+**Extends**: StandardHandler
+**Used by**: BusinessProcess, CompactLayout, FieldSet, Index, ListView, RecordType, SharingReason, ValidationRule, WebLink (and any child type without `xmlTag` whose parent has `decomposition: "folderPerType"`)
+
+Handles child types living in CustomObject sub-folders. Element names are qualified as `ObjectName.ChildName`.
+
+#### FlowHandler
+
+**Extends**: StandardHandler
+**Used by**: Flow
+
+Standard behavior plus a warning on deletion — deleting a Flow requires manual deactivation first (Salesforce API limitation).
+
+---
+
+## Stage 5: Post-Processing Chain
+
+**Entry**: `PostProcessorManager` (`src/post-processor/postProcessorManager.ts`)
+
+After handlers produce their results, post-processors run in two phases:
+
+```mermaid
+flowchart TD
+    HR["Handler pass<br/>HandlerResult{elements}"] --> HV["handlerView =<br/>ChangeSet.from(elements)"]
+    HV --> C["Collectors phase<br/>(collectAll)"]
+    C --> F["assembleChanges()<br/>fold + rollup filter + renames"]
+    HR --> F
+    F --> IO["I/O Execution"]
+    IO --> P["Processors phase<br/>(executeRemaining)"]
+
+    subgraph Collectors
+        FT["FlowTranslationProcessor"]
+        IP["IncludeProcessor"]
+    end
+
+    subgraph Processors
+        PG["PackageGenerator"]
+        CM["ChangesManifestProcessor"]
+    end
+
+    C --> FT
+    C --> IP
+    P --> PG
+    P --> CM
+```
+
+### Two-Phase Execution
+
+**Collectors** (`isCollector = true`) run first via `collectAll(handlerView)`, where `handlerView` is a `ChangeSet` built from the handler pass's elements alone (`ChangeSet.from(handlerResult.elements)`) — before any collector output exists. Each collector returns its own `HandlerResult`:
+
+- **FlowTranslationProcessor**: when Flows are being deployed, uses `GitAdapter.grepMatchingPathspecs()` (the pattern-matching grep surface) — a tree walk over the per-revision blob index filtered by pathspec (`<source>/*<extension><metaFileSuffix>`, literal + glob — `<source>` is already a canonicalised, literal `config.source` entry; the glob half is sgd's own construction, never something the user typed), reading each candidate via `repo.primitives.readBlob` and testing it with a JS `RegExp` — to find `.translation-meta.xml` files containing `flowDefinitions` elements matching deployed flows. It reads `handlerView.forPackageManifest()` to decide which flows are in scope, so a Flow that only enters the manifest through `--include` or another collector is invisible to it — the handler-pass-only view is what keeps that scoping deterministic regardless of collector registration order. This avoids requiring the (separate) `TreeIndex` used by `getFilesPath`. Produces pruned translation files as computed content.
+- **IncludeProcessor**: handles `--include` and `--include-destructive` flags. Lists every file under `config.source` at `config.to` through the run's `to` index (built under `config.source` scope whenever an include file is set, in every mode), filters through the include patterns, then processes the matching lines through `DiffLineInterpreter` as synthetic additions/deletions. Additions run with `{ from: EMPTY_TREE_OID, to: config.to }` and deletions with `{ from: config.to, to: EMPTY_TREE_OID }` (`src/constant/gitConstants.ts`), both through `withRevisions` (`src/types/runContext.ts`), which overrides only the revisions and carries `trees` through unchanged. Git's empty tree is the "nothing" side of both passes: `GitAdapter.flattenRevision` serves it as an index with no path, so a blob read there misses exactly like a file absent from a real revision, and no tree reader ever holds it (only `--from`/`--to`, which must be commits, are indexed), so every liveness check on the DELETION pass's effective `to` answers `false`. An in-file type (`InFileHandler`) therefore diffs the included file against nothing: the ADDITION pass yields every sub-element the file holds at `config.to` as added, the DELETION pass every one of them as deleted, whatever the file's history. The pass used to diff against the repository's first commit instead, which leaked that commit's content into both manifests whenever it held the file — always the case in a shallow clone, where the graft boundary is the first reachable commit.
+
+**Processors** (`isCollector = false`) run last via `executeRemaining(changes)`, in registration order, where `changes` is the fully assembled `ChangeSet` (see "Assembly — the explicit fold" below):
+
+- **PackageGenerator**: writes `package.xml` (from `changes.forPackageManifest()`), `destructiveChanges.xml` (from `changes.forDestructiveManifest()` — already coalesced to drop delete entries that are re-added or re-modified in the same diff), and the required companion empty `package.xml` for destructive deployments.
+- **ChangesManifestProcessor**: opt-in via `--changes-manifest`. Serializes `changes.byChangeKind()` into a JSON file alongside the xml manifests, grouped by `ChangeKind` (`add` / `modify` / `delete`, plus `rename` as `{from, to}` pairs when git `-M` detects component renames). Powered by the `changeKind` field carried on every `ManifestElement` for add/modify/delete and by the rename triples folded into `changes` at assembly time.
+
+Each processor is wrapped in error isolation — failures produce warnings rather than crashing the pipeline.
+
+### Assembly — the explicit fold
+
+Stage 4 and the collectors phase each return a `HandlerResult` — a flat, readonly `{ elements, copies, warnings }` value, never a container shared with anyone else. `assembleChanges()` (`src/utils/changesAssembly.ts`), called once from `main.ts`, is the single place these get folded into the `ChangeSet` read model that `IOExecutor` and the processors phase consume:
+
+1. `mergeResults(handlerResult, postResult)` concatenates the handler pass's and the collectors' `elements` / `copies` / `warnings` arrays.
+2. `applyBundleRollup(combinedResult.elements)` (`src/utils/bundleRollup.ts`) is a pure filter, `(elements) → { keptElements, warnings }`. Per manifest target (`package` / `destructiveChanges` independently): when a `DigitalExperienceBundle` member is present it drops the redundant `DigitalExperience` members of that same site — a `DigitalExperienceBundle` deploys or deletes every child, so listing both is redundant — and warns when a `DigitalExperienceBundle` lands in `destructiveChanges` (whole-bundle deletion is org-gated on the Experience site being deactivated first). Today's implementation is specific to the DEB/DE pair; the function shape leaves room for a generic parent/child config when a second pair appears.
+3. `ChangeSet.from(keptElements, corroboratedRenames(keptElements, renameTriples))` builds the run's `changes` read model exactly once. `corroboratedRenames` keeps a `{type, from, to}` triple from `RenameResolver.resolve()` only when `keptElements` already hold `to` as a `Package` member and `from` as a `Package` or `DestructiveChanges` member of the same type; any other triple is dropped silently and the pair surfaces as the plain add/delete the handler pass emitted.
+
+The ordering here is load-bearing:
+
+- The rollup filter runs on the **combined** (handler + collector) elements, and its output — `keptElements` — is the only value that feeds `ChangeSet.from`. `PackageGenerator` and the `changes` returned on `Work` therefore always read the same post-filter value; nothing downstream can see a pre-rollup manifest.
+- Renames are corroborated against that same post-rollup combined set, never the handler-pass-only `handlerView`; a rename may only relabel members the handler pass or a collector emitted.
+- The rename filter reads `keptElements`, so it must run after the rollup — this order is load-bearing: a `DigitalExperience` child the rollup folds under its bundle loses its rename triple.
+
+`assembleChanges()`'s `warnings` output is `[...combinedResult.warnings, ...rollupWarnings]` — the rollup's warnings (e.g. the DEB-deletion notice) join the sequence immediately after the handler-and-collector warnings, which is where `main.ts` places them in the run's final warning list (see "Work" in Key Types Reference).
+
+### Change-kind pipeline
+
+Every `ManifestElement` produced by a handler is tagged with a `ChangeKind`. This tag is set at three sites:
+
+- **`StandardHandler._collectManifestElement`** derives the kind from the git change type (`A` → `add`, `M` → `modify`, `D` → `delete`) via the `CHANGE_KIND_BY_GIT_TYPE` map. All handlers using the default manifest builder inherit this.
+- **`InFileHandler._collectManifestFromComparison`** takes the kind as a parameter so sub-elements get the correct label from `MetadataDiff.compare()` — which returns three disjoint buckets: `added` (key absent in `from`), `modified` (key present but content differs), `deleted` (key absent in `to`). The keyless-element case is bucketed as modified.
+- **Direct constructors** (`BotHandler`, `FlowTranslationProcessor`) stamp the kind explicitly at their push site.
+
+`ChangeSet.from(elements, renames)` is the single ingestion point — construction happens exactly once per run, in `assembleChanges()`. Each `ManifestElement` carries two orthogonal axes — `target` (deployment contract: `Package` vs `DestructiveChanges`) and `changeKind` (review semantics: `Add` / `Modify` / `Delete`) — and the ChangeSet stores both:
+
+- `byTarget: Record<ManifestTarget, Manifest>` drives the xml manifests.
+- `byKind: Record<AddKind, Manifest>` drives the review-oriented JSON.
+
+The wire format is a flat array end-to-end, never a `ChangeSet` instance: `HandlerResult.elements` (`readonly ManifestElement[]`) is what every handler and collector returns, and `DiffLineInterpreter.process()` folds those arrays with a plain array push — no handler ever sees another handler's output, let alone writes into it. The `toElements()` view is the inverse: it reconstructs `(target, type, member, changeKind)` tuples from the indexed buckets on demand for tests and diagnostics, joining `byTarget × byKind` on `(type, member)`.
+
+The two axes are **not redundant**: a single element can be `(target=Package, changeKind=Delete)`, which is what `InFileHandler` stamps when a container file (e.g. `CustomLabels`) is deleted but child elements survive — the deployment must still list the container under `package.xml` while the JSON manifest surfaces a delete for reviewer visibility. Views route on the correct axis:
+
+- `forPackageManifest()` — `byTarget[Package]` ∪ rename-target per type (used by `PackageGenerator`, `FlowTranslationProcessor`). Corroboration guarantees rename targets are already in `byTarget`, so the union never changes this view.
+- `forDestructiveManifest()` — `byTarget[DestructiveChanges]` ∪ rename-source, minus anything that winds up in the package view (drops cancelled deletions and covers rename semantics in a single coalesce; rename sources are already in `byTarget` after corroboration, so the union never changes this view either), then strips any `UNDELETABLE_TYPES` type wholesale — today just `RecordType`, via `_stripUndeletableTypes` — since the Metadata API refuses to delete these types and a destructive entry for one is a component failure that fails the whole deploy; this runs first, ahead of the two suppressors below, and `byChangeKind()`'s delete bucket deliberately keeps the member, the same asymmetry the `BotVersion` rule below describes — then drops a `Report` or `Dashboard` member whose DeveloperName (the path segment after the last `/`, compared case-insensitively) is also carried by a surviving member of the same type — the Metadata API relocates these two types on deploy rather than copying them, so a destructive entry for the old path would delete what the deploy just moved — then drops a `BotVersion` member whose parent `Bot` (the segment before the first dot of `<bot>.<version>`) is itself in the destructive `Bot` set — a deleted Bot takes its versions with it. `byChangeKind()`'s delete bucket deliberately keeps the version, since the file really was deleted. `undeletableDeletions()` re-runs the same orphaned-deletes computation and reports, per `UNDELETABLE_TYPES` type, exactly the members the strip above just removed — a query, never an emitter — which `main.ts` turns into the `warning.UndeletableComponentsOmitted` warning.
+- `byChangeKind()` — per-kind record. Rename participants are removed from the add/delete buckets so every emitted entry lives in exactly one user-visible bucket; the `rename` bucket contains `{from, to}` pairs deduplicated per type. The `Report`/`Dashboard` DeveloperName suppression applies here too, so the destructive view and the delete bucket never disagree about a suppressed move — the opposite of the `BotVersion` rule above, where `byChangeKind()` deliberately keeps the version. The two call sites deliberately use different reference sets: the destructive view compares surviving members against the full package view, while the delete bucket compares against `Add ∪ Modify` alone — folding the rename sources in here would let a delete match its own leaf through a sibling pair.
+
+Rename detection uses tsgit's `detectRenames` diff option, **gated on `config.changesManifest`**. Default sgd runs pass `detectRenames: false` so line shape matches the pre-feature output; only `--changes-manifest <file>` turns it on, independent of `--ignore-whitespace`. When enabled, `RepoGitDiff` splits each `R<score>\tfrom\tto` line into a synthetic `D\tfrom` + `A\tto` pair so the existing handler pipeline processes them normally, while capturing the pair. `RenameResolver.resolve(pairs)` acquires the cached `IgnoreHelper` once per call (not once per pair) and gates both sides of every pair through `keep()` — `D\t<fromPath>` against the destructive matcher, `A\t<toPath>` against the global one — before either path is resolved through `TypeHandlerFactory`. A pair rejected on either side yields no triple, so the rename degrades to the delete-and-add shape the handler pipeline already produces for an ordinary, unrelated add/delete pair. A pair that survives both gates resolves through `TypeHandlerFactory` to recover `(type, from-member, to-member)`, returned rather than written anywhere — `ChangeSet.from` folds them in with a Map-keyed dedupe (`` `${from}\0${to}` ``) so bundle renames re-emitted per file collapse to a single entry. A triple that survives resolution is still dropped in `assembleChanges()` unless corroborated as described in "Assembly — the explicit fold", so a rename only relabels and never changes either xml manifest: a renamed non-metadata file (`classes/notes.txt`), a mixed pair (`readme.txt → Foo.cls`), a case-only rename (`A.cls → a.cls`, whose delete line is cancelled) and a non-`pruneOnly` InFile container rename (Workflow `Account → Contact`, whose deletion emits only sub-elements) all yield exactly the default run's xml manifests, with the emitted side(s) in the JSON add/delete buckets rather than `rename`. Corroboration matches on `(type, member)`, not on path, so an unrelated change to a same-named member in the same diff can still corroborate a pair (JSON only; the xml manifests are unaffected).
+
+Package.xml remains byte-identical to the pre-feature output because `InFileHandler` still routes both `added` and `modified` sub-elements to `ManifestTarget.Package`; the ChangeSet merely tags them differently.
+
+---
+
+## Stage 6: I/O Execution
+
+**Entry**: `IOExecutor.execute(copies)` (`src/adapter/ioExecutor.ts`)
+
+Executes the accumulated copy operations with concurrency bounded by `getConcurrencyThreshold()`, in two passes: every other kind first, then `AugmentedContent`. Six operation kinds:
+
+| Kind              | Description                                                                                                        |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `GitCopy`         | Reads a single file from a specific git revision by resolving its path to a blob `ObjectId` (via the per-revision blob index) and reading it straight out of the object store with `repo.primitives.readBlob`, then writes it to the output directory. Blobs above `SIZE_THRESHOLD` (1 MB) escalate to the streaming path via `EscalateToStreamingSignal` and pipe through an atomic `.tmp` + `rename` to bound peak memory. Does not require the tree index. |
+| `GitComponentCopy` | Emitted under `--generate-delta`, one per changed line, by `InResourceHandler` and its subclasses — except `ObjectTranslationHandler`, whose addition path bypasses the component request — and by `InFolderHandler` and `ReportingFolderHandler` (path = the line's base path without its last extension). `execute` expands each distinct (revision, path) once, at the first request's position, into per-file `GitCopy` operations — every file whose path starts with the request path followed by `/` or `.`, taken from one listing of the request's parent directory per (revision, parent directory), however many components that directory holds; later identical requests vanish. Each expanded file then takes the ordinary `GitCopy` path (processedPaths, ignore, out-of-output guard, LFS, streaming escalation). |
+| `GitTypeDirCompanionCopy` | Emitted by `LwcHandler` (LightningComponentBundle, AuraDefinitionBundle, GenAiFunction, UIBundle) under `--generate-delta`, one per changed line. `execute` first expands each distinct (revision, type directory) once, at the first request's position, into per-file `GitCopy` operations — every file directly in the directory and every file under each subdirectory that is not a bundle (a bundle holds a direct `<name>.<x>-meta.xml` entry, SDR's root-metadata rule); sibling bundles are skipped. This expansion runs before the `GitComponentCopy` expansion, and paths both produce are read and written once through `processedPaths`. `FileCopyOperation` excludes both request kinds, so only file operations reach `_executeOperation`. |
+| `GitDirCopy`      | Enumerates all files under a directory path via `getFilesPath` (requires tree index). Below `GIT_ARCHIVE_DIR_THRESHOLD` (25 files) each file is fetched with one `readBlob` call per file; above the threshold the executor switches to `streamArchive`, which streams every blob under the path — reusing the same per-revision blob index, no second tree walk — via `repo.primitives.streamBlob`, piping each entry directly into a sibling `.tmp` + `rename`. The emitter is `ContainedDecomposedHandler` (PermissionSet decomposed dirs); `StaticResource` and `ExperienceBundle` go through `GitComponentCopy`. Archive entries are lazy and resolve LFS pointers exactly like `GitCopy`. A skipped entry (not listed, already processed, ignored, or outside the output) is destroyed unread; an entry that fails to write is skipped and logged while the rest of the directory is copied. Defence-in-depth path-prefix check rejects any entry whose resolved destination escapes `config.output`. |
+| `StreamedContent` | Writes content emitted by a handler/collector-supplied producer function (typically pruned XML from `InFileHandler`, `ObjectTranslationHandler`, and `PackageGenerator`). The executor pipes the producer into a sibling `.tmp` file and renames atomically on success — handles back-pressure via the writer's own `drain` await and survives EXDEV cross-filesystem rename hazards (Docker overlayfs + tmpfs `/tmp`). |
+| `AugmentedContent` | Emitted by `FlowTranslationProcessor`. Same atomic `.tmp` + `rename` write as `StreamedContent`, but runs in a second pass once every other operation has settled and is exempt from `processedPaths`: its writer receives what the first pass of the same run wrote at that path (the in-file-pruned locale translation), read back by the executor only when `processedPaths` holds the path, and adds the packaged Flows' `flowDefinitions`. A file a previous run left in `--output-dir` is never read, so it cannot leak into the delta; the processor falls back to reading the file in place only when `--output-dir` is the repository itself. Without the second pass the first-wins `processedPaths` dedup would drop it whenever the same locale file also changed. |
+
+LFS detection lives in every `GitAdapter` content resolver: `getBufferContent`, `getBufferContentOrEscalate`, and the shared streaming pipeline behind `streamContent` and `streamArchive`. If the content starts with an LFS pointer signature, the resolver reads the actual object from the local LFS cache instead. Blobs that exceed `SIZE_THRESHOLD` raise an `EscalateToStreamingSignal` instead of returning a buffer, telling the executor to switch to the streaming path.
+
+---
+
+## Cross-Cutting Concerns
+
+### Error Handling
+
+SGD follows a **warnings-not-exceptions** philosophy for per-file errors:
+
+| Layer | Strategy |
+| ----- | -------- |
+| Config validation | Fatal: throws `ConfigError` / `MetadataRegistryError` → propagates to CLI |
+| Handlers (`collect()`) | Catches all errors → converts to warnings in `HandlerResult` |
+| Aggregation fold (`DiffLineInterpreter` worker, `assembleChanges`) | Must be total, not per-file: a throw here aborts the whole pass. Both are array pushes / `ChangeSet.from` inserts over results handlers already caught, not fallible I/O |
+| Post-processors | Each wrapped in `_safeProcess` → failures become warnings |
+| Git operations | Debug-logged, return empty/false → silent degradation, except a failed tree-index walk on `config.to`, which also raises `warning.TreeIndexUnavailable` |
+| XML parsing | Produces "MalformedXML" warning with file path and revision |
+
+This ensures a single broken file never aborts processing of the entire diff.
+
+Error types form a hierarchy:
+- `SgdError` (base) — wraps original error as `cause`
+- `ConfigError` — invalid user configuration
+- `MetadataRegistryError` — invalid additional metadata registry
+
+### Concurrency
+
+Every parallel operation uses `getConcurrencyThreshold()` from `src/utils/concurrencyUtils.ts`, which returns `min(availableParallelism(), 6)`. The cap at 6 is a deliberate CI/CD safety constraint — the plugin runs on small CI machines.
+
+Bounded concurrency is provided by `src/utils/concurrency/` — an in-house module exposing `BoundedQueue<T>`, `eachLimit`, and `filterLimit`. `BoundedQueue` is the core primitive: synchronous `push`, idle-aware `drain`, fail-fast error propagation. `eachLimit` and `filterLimit` wrap it; `filterLimit` preserves input order in its output. Unbounded `Promise.all` is never used for file or git operations.
+
+### Logging
+
+Two complementary mechanisms:
+
+**`lazy` template tag** (`src/utils/LoggingService.ts`): defers string interpolation until the log level is active. Expressions are evaluated eagerly by JavaScript, so expensive computations must be wrapped as arrow functions:
+
+```typescript
+Logger.debug(lazy`result: ${() => JSON.stringify(largeObject)}`)
+```
+
+**`@log` decorator** (`src/utils/LoggingDecorator.ts`): emits `Logger.trace` entry/exit on decorated methods. Works for both sync and async functions. Applied pervasively across handlers, adapters, and processors.
+
+### Git Adapter
+
+`GitAdapter` (`src/adapter/GitAdapter.ts`) is sgd's single git engine: an in-process reader over the repository's object store via [`@scolladon/tsgit`](https://www.npmjs.com/package/@scolladon/tsgit), a zero-dependency git implementation. There is no `git` binary requirement and no subprocess — every operation that used to shell out (`rev-parse`, `ls-tree`, `rev-list`, `cat-file`, `diff`, `archive`, `grep`, `merge-base`) now reads the object store directly through tsgit's `Repository` facade. The adapter is bound to the **repository**, not to any one run: the singleton pool key is `sanitizePath(resolve(config.repo))` alone — an absolute path, so every concurrent `sgd()` call against the same repository — regardless of its `from`, `to`, or `source` — shares one `GitAdapter` instance and one open `Repository` handle. The constructor takes two strings, not a `Config` — the sanitized pool key and the platform-native repository path — so the class holds no per-run state; per-run parameters (`DiffSpec`, `DiffScopeVerdict`, source scopes, revisions) are threaded through as plain method arguments on every call instead. The two are kept apart because they serve different jobs: the sanitized key is the pool map key and what every user-facing message renders, while the platform-native path is what actually gets opened and read from (`openRepository`'s `cwd`, LFS object paths) — `sanitizePath`'s posix-only normalisation is safe for an identity key but would corrupt a win32 UNC root if reads used it instead.
+
+**Repository open and trust posture**: `getRepo()` opens with `openRepository({ cwd, trust: 'always', hooks: false, command: false })`; `cwd` is always resolved to an absolute path first, because tsgit 3.5.0 validates it eagerly and refuses anything relative outright. sgd only ever reads — revParse, diff, tree walks, blob reads — never a verb that fires a hook or a merge driver, so `hooks: false` and `command: false` switch off both code-execution surfaces by construction rather than leaving them gated on the ownership check as a proxy for them. `trust: 'always'` opts out of that ownership check for a specific reason: it would otherwise refuse the container-mounted checkouts README.md documents as supported, and tsgit deliberately cannot read the `safe.directory` entry those users already set in git's own config to fix that same refusal — so a CI pipeline that already applied git's documented fix would keep working for `git` and start failing for `sgd`. These two are the surfaces that matter for sgd, not the complete set tsgit's Node context wires up: it also always attaches a third spawning runner, `ssh`, with no public option to disable it. It is unreachable here — reached only from transport verbs (`fetch`/`pull`/`push`/`clone`), none of which sgd calls — but a future reader auditing the full runner set should not be surprised to find it.
+
+**Tree index**: The tree index is a path-segment trie (`TreeIndex` in `src/adapter/treeIndex.ts`) that answers `pathExists`, `fileExists` (a file, not a directory), `getFilesPath`, and `listChildren` in O(path-depth) — the trie replaces an earlier flat `Set<string>` that required O(n) prefix scans. Ownership sits with the caller, not the adapter: `GitAdapter.buildTreeIndex(revision, scopePaths)` resolves the revision to its commit, calls `repo.primitives.flattenTree` once on that commit's tree (a single bulk traversal, not a per-entry walk) to build a `path -> blob ObjectId` map, indexes only the paths in `scopePaths`, and **returns** the resulting `TreeIndex` instead of caching it on `this`. Three costs are billed per revision: the shared `indexRevision` flatten (see Blob reads below — memoised on the adapter, so only the first call against a given revision pays it: ~372 ms at 39 000 files, ~0.005 ms on every later call against that same revision — and memoised as the *pending* build, so concurrent first callers — `buildRunTreeReader`'s two slots when `--from` equals `--to`, or the handler queue on a run whose scope is empty — share that one walk rather than each paying it), an `inScope` (`src/adapter/pathMatching.ts`) ancestor-prefix `Set` membership test walked once per flattened path — O(path depth) regardless of scope count, ~10-13 ms flat at 39 000 files — and the `TreeIndex` trie build itself, ~13-15 ms. The scope filter used to dominate by nearly three orders of magnitude: before it was rewritten as the `Set` walk, it scanned every path against every scope (`scopes.some(startsWith)`), measured at 6 216 ms per revision for 39 000 files × 1 000 scopes. `buildRunTreeReader` (`src/utils/treeReaderBuilder.ts`, called once by `src/main.ts`) calls it once per revision (`config.to` and `config.from`, in parallel via `Promise.all`) and returns `{ trees, unindexed }`: `trees` assembles the results into a `TreeReader` (`src/adapter/treeReader.ts` — `createTreeReader`, the revision-explicit `pathExists(revision, path)` / `fileExists(revision, path)` / `filesUnder(revision, paths)` / `children(revision, dir)`, and the `EMPTY_TREE_READER` default) and is threaded into every consumer inside a `RunContext` (`src/types/runContext.ts` — `{ config, metadata, trees }`), so a missed thread is a compile error rather than a silently empty read; `unindexed` names which of the two revisions came back with no index (empty when both walks succeeded, and never populated when `scopePaths` was empty — nothing was attempted). `main.ts` pushes the `warning.TreeIndexUnavailable` warning when `config.to` is unindexed — the revision every liveness read resolves through — mirroring the held-addition probe's `warning.IgnoredMoveCheckSkipped` shape; the manifest content itself is unchanged, since the degrade still degrades. A builder/reader scope mismatch is structurally impossible: every read names its revision at the call site and resolves to the exact index the run built for it, instead of recomputing against — or drifting from — a shared, scope-keyed cache. An unindexed revision resolves to a shared empty `TreeIndex` (a Null Object), so the "reads as empty" degradation is expressed once inside the reader rather than repeated as `?? false` / `?? []` at each call site. Scope computation (`computeTreeIndexScope` in `src/utils/treeIndexScope.ts`) analyzes diff lines against the metadata registry to determine which type directories require tree-index lookups — only types using `InResource`, `InFolder`, `ReportingFolder`, `InBundle`, `Lwc`, `CustomObject`, `ContainedDecomposed`, `ExternalServiceRegistration`, `ObjectTranslation` (`CustomObjectTranslation`, whose deletion liveness reads the component folder), or `MetadataBoundaryResolver` deep-path resolution need the index. Every index-needing type — `bundle` / `digitalExperience` / `mixedContent` adapters included — scopes to its type directory rather than the touched component's own directory: the memoised flatten already holds the whole tree, so `pathExists` on a bundle's directory answers identically whether the index was built from just that bundle or the whole type directory, and scoping to the type directory collapses scope count to (index-needing types × source dirs) instead of one scope per touched bundle. When `--include` or `--include-destructive` is set, the scope defaults to the canonical paths of `config.source` since the include processor may touch any type — both scope domains are literal repository paths, which is why `buildTreeIndex` filters with the single `inScope` predicate rather than needing a separate wildmatch arm. The two indexes are built in every mode — `--generate-delta` never decides whether they exist, only whether files are copied — so `package.xml` and `destructiveChanges.xml` are identical with and without the flag (pinned by `__tests__/integration/manifestParityAcrossGenerateDelta.test.ts`). Only an empty computed scope (a diff touching no index-needing type) leaves the run on `EMPTY_TREE_READER`, and only a failed tree walk leaves one revision unindexed (surfaced via `unindexed` above); both degrade to reads that answer `false` / `[]` (see Error mapping below).
+
+**Blob reads**: `indexRevision(revision)` — shared by `buildTreeIndex`, blob reads, archive streaming, and grep — flattens the full, unscoped tree at a revision once via `repo.primitives.flattenTree` and memoizes the *pending build* of the `path -> blob ObjectId` map on `blobIdIndex` before its first `await`, so a caller arriving while the walk is in flight awaits it instead of starting another; a build that rejects is evicted, so the next caller retries rather than inheriting the failure (the tsgit counterpart of `git cat-file --batch` oid:path resolution). Unlike the tree index, this memo carries no caller-supplied scope and is deterministic per revision, so it is safe to keep on the repo-bound `GitAdapter` instance and share across every run against that repository. `getBufferContent`, `getBufferContentOrEscalate`, `streamContent`, `streamArchive`, and both grep surfaces (`grepUnderPaths`, `grepMatchingPathspecs`) all resolve paths through it before calling `repo.primitives.readBlob`/`streamBlob` directly. `streamArchive` resolves blob ids through that index and yields each entry's stream lazily, with no per-entry read before the yield. There is no batch process, no stdin/stdout protocol, and no FIFO queue to maintain — each read is a direct object-store lookup.
+
+Literal grep surface: `grepUnderPaths` resolves its specs through a sorted path index (`SortedPathIndex`, `src/adapter/sortedPathIndex.ts`) — an exact hit or a binary-searched directory range, with no per-call scan of the revision. The index is memoised per blob-id map in a `WeakMap` on the adapter, so it is built once per flattened revision and released with that map. The pattern surface (`grepMatchingPathspecs`) keeps its walk over every path with the wildmatch matcher.
+
+Lifecycle: `GitAdapter.closeAll()` is `async` and awaits `repo.dispose()` on every open `Repository` handle before clearing the singleton instances map. It is called in a `finally` block in `src/main.ts` on both success and error paths, giving deterministic pack-handle close instead of relying on process exit or GC.
+
+**Streaming and memory bound**: `getBufferContentOrEscalate` accumulates `streamBlob` chunks and watches the running total; crossing `SIZE_THRESHOLD` (1 MB) throws `EscalateToStreamingSignal` instead of continuing to materialize the buffer. The caller (`IOExecutor`) then falls back to `streamContent`. `streamContent` and every `streamArchive` entry share one lazy, pull-based generator (`blobContentChunks`) wrapped by `Readable.from`: nothing is read until the consumer reads, and peak memory is bounded by the stream's high-water mark, not the blob size. The generator peeks the first `LFS_MAGIC.length` bytes of the `streamBlob` iterator before forwarding anything: a match hands off to the resolved LFS object file on disk, a miss forwards the peeked head plus every remaining chunk unmodified.
+
+**Merge base**: `GitAdapter.getMergeBase(from, to)` is the in-process equivalent of `git merge-base <from> <to>`: it resolves both refs via `revParse`, peels each to a commit, and calls `repo.primitives.mergeBase`, taking only the first of the (possibly several, for criss-cross histories) candidates it returns — matching `git merge-base`'s own default without `--all`. tsgit's `[]` result (no common ancestor) surfaces as `undefined`, a legitimate git answer rather than a thrown error; turning that into a user-facing `MergeBaseNotFound` is `ConfigValidator`'s job (see Stage 1 above), not this adapter's.
+
+**Error mapping**: `mapTsgitError` (`src/adapter/tsgitErrorMap.ts`) normalizes tsgit's exceptions to sgd's expected error shape at each adapter method boundary — `resolveCommit`, `streamDiffLines` (via its internal `requestDiff`), `getBufferContent`, `getStringContent`, and `getMergeBase`. `grepUnderPaths`, `grepMatchingPathspecs`, and `buildTreeIndex` debug-log and degrade instead of throwing, consistent with the warnings-not-exceptions policy below. The mapper is a pure function of the operation context and the repository path: it checks for object-not-found first, then walks a code-keyed repository-refusal table, then falls back to a generic passthrough, rendering refusal messages from sgd's own repository path (tsgit renders paths basename-only) and returning a typed `RepositoryRefusalError` so `ConfigValidator` can report it directly instead of the vaguer per-ref `ParameterIsNotGitSHA`. sgd's own `SgdError` subclasses (`RepositoryRefusalError`, `NotACommitError`) pass through `mapTsgitError` by identity — they are already release-shaped; only raw tsgit rejections are rewritten.
+
+`peelToCommit(oid, label)` — reached through the private `peelRevision(revision)` helper (`getRepo` -> `revParse` -> single-revision check -> `peelToCommit`) that `resolveCommit` (validation), `flattenRevision` (the `indexRevision` walk), and `getMergeBase` share — follows a resolved oid down through any tag chain to the commit it ultimately points at. tsgit's `revParse` answers every line `git rev-parse` would print, so the check enforces `rev-parse --verify` semantics: exactly one non-negated object entry — a range, an exclusion (`^A`) or a working-tree path is refused before any object read. `revParse` returns the tag **object** oid for an annotated tag rather than auto-peeling, and tsgit's `mergeBase` primitive does not peel either; without this step, `--from v1.0.0 --merge-base` would compare the tag object against a commit and falsely report no merge base. A chain ending in a tree or blob raises a typed `NotACommitError` carrying the object kind, which `ConfigValidator` renders as `error.ParameterIsNotCommit`.
+
+**Fidelity notes**: result order of `grepUnderPaths` is spec order, code-unit sorted inside a directory, with first-seen dedupe; consumers must not depend on it. `grepBlobs` — the private content matcher shared by `grepUnderPaths` and `grepMatchingPathspecs` — matches content with JS `RegExp` semantics, not POSIX basic regex; callers only ever pass metacharacter-free literals (guarded by `gitGrepPatternInventory.test.ts`), so the two semantics agree in practice. A second fidelity axis follows from the path-matching split between the two surfaces: path matching is literal-prefix on `grepUnderPaths`' concrete-path surface and wildmatch on `grepMatchingPathspecs`' pattern surface — only sgd-constructed values, already validated to carry no wildcard metacharacters, reach the latter.
+
+### XML Reading & Writing
+
+XML reading uses [txml](https://www.npmjs.com/package/txml) — a small, fast parser that takes the source string and returns a flat `(tNode | string)[]` tree. `txmlAdapter.ts` normalises the tree into our compact `XmlContent` shape (`@_attr` for attributes, `#comment` for comments, repeated tags collapsed to arrays, `?xml` for the declaration). Two entry points:
+
+- **Full-document parse** (`xmlHelper.xml2Json`): used by `parseXmlFileToJson` for bounded inputs (FlowTranslationProcessor's translation merge). One `txmlParse(...)` call + one tree walk.
+- **Streaming parse** (`xmlEventReader.driveParse`): used by `metadataDiff.run` and `FlowTranslationProcessor._parseTranslationFile`. Walks the prologue manually to capture `<?xml?>` and the root open tag, then loops over the body calling `txmlParse(payload, { pos, parseNode: true, setPos: true })` once per direct child of root. The parsed subtree is fed to `onElement` and our reference is dropped before advancing the cursor — peak resident memory ≈ largest single child rather than the full document.
+
+The strict failure contract that `metadataDiff` depends on (txml is otherwise tolerant — `<Root><unclosed>` parses to a partial tree without throwing, `<a></a><b/>` returns multiple roots, `<a></a>extra` accepts trailing junk) is preserved inside the streaming reader itself. `parsePrologue` skips the XML declaration, leading whitespace, comments, and `<!...>` declarations (DOCTYPE, ENTITY) and tracks `isSelfClosing`. The per-child `parseNode` loop already throws on inner mismatches and crossed nesting via txml itself. After the loop, `verifyTail` confirms the document ends with `</rootName>` (or is a self-closing root) followed only by whitespace or comments — anything else throws so the diff caller's `MalformedXML` warning fires. `parseToSidePropagating` runs `verifyTail`; `parseFromSideSwallowing` skips it because its caller already discards parse errors and falls back to "no prior content", and txml's tolerant partial parse is fine there. No CDATA branch: Salesforce metadata never uses CDATA.
+
+XML writing is in-house (`xmlWriter.ts`). Iterative depth-first traversal with an explicit LIFO frame stack — safe under unexpectedly-deep input, cancellation-friendly. Frame chunks are batched in a `ChunkBuffer` (8 KB threshold) before flushing to the underlying `Writable` so a 3 000-element Profile prune flushes in tens of stream writes instead of thousands. Backpressure is honoured at flush time via `once(out, 'drain')`. Indent strings are cached in a lazily-extended array keyed by depth, replacing the per-frame `INDENT.repeat(depth)` allocation.
+
+Element text is written **verbatim by default** — the metadata-diff and flow-translation callers feed it values that came from the txml passthrough reader (already XML-escaped), so re-escaping would corrupt the byte-identical round-trip. The opt-in `WriteOptions.escape` flag turns on `escapeXmlText` for element text (`&`→`&amp;`, `<`→`&lt;`, `>`→`&gt;`); only `PackageBuilder` sets it, because package.xml / destructiveChanges.xml member names are raw domain data (component names from the diff) rather than parsed-back XML. Attributes are never escaped: the only attribute values emitted are fixed (`xmlns`, the `<?xml?>` declaration) or already-escaped passthrough content.
+
+### Lookup Caches
+
+Four memoization caches sit on the lookup hot path. The first two have a lifetime scoped to the surrounding instance and need no eviction; the last two are described after them:
+
+- **`MetadataRepositoryImpl.pathCache`** memoizes `get(path)` results (including negative lookups) on a `Map<string, Metadata|undefined>`. `get()` strips the diff-status prefix (`GIT_DIFF_TYPE_REGEX`, e.g. `A\t`) before resolving and caching; `TypeHandlerFactory.getTypeHandler` strips that same prefix itself before calling in. The two therefore land on the same cache entry per file, so `has(line)`, `getFullyQualifiedName(line)`, and `TypeHandlerFactory.getTypeHandler` share one search chain per line rather than each paying their own. Stripping first also lets a repository whose package directory is the repository root resolve at all — the raw prefix used to corrupt the path's first segment for every directory-resolved type. The lookup chain itself is `searchByExtension` + `searchByDirectory`, deterministic in the stripped path; direct lookup by XML name (`getByXmlName`) is a separate index and plays no part in path resolution. A suffix declared by more than one type (`unsafeExtensions`) is tracked per registry instance, so a custom `--additional-metadata-registry` cannot make a suffix ambiguous for every registry built after it.
+- **`TypeHandlerFactory.handlerCache`** memoizes `resolveHandler(metadata)` → handler-class on a `Map<Metadata, typeof Standard>`. Dispatch involves five branches plus a `getByXmlName` lookup, all deterministic in the metadata reference — and the registry returns the same instance for a given type. Reference-keyed (not xmlName-keyed) to skip the string hash on every call.
+- **`GitAdapter` sorted path index** (`src/adapter/sortedPathIndex.ts`) backs `grepUnderPaths`. Pool-scoped: one per blob-id map, held in a `WeakMap` keyed by that map, so it lives as long as the adapter's revision index and is dropped with it.
+- **`RunContext.parentDiffs`** (`src/utils/metadataDiff/parentDiffMemo.ts`) memoizes the parent `objectTranslation` diff outcome. Per run and per revision pair, keyed by parent path; a rejected diff is evicted so the next caller retries, and `withRevisions` installs a fresh one for the include passes.
+
+---
+
+## Extensibility Points
+
+### For Users
+
+| Mechanism | Purpose |
+| --------- | ------- |
+| `--additional-metadata-registry` | JSON file defining custom metadata types (Zod-validated) |
+| `--ignore-file` / `--ignore-destructive-file` | Gitignore-format exclusion patterns |
+| `--include-file` / `--include-destructive-file` | Force-include paths regardless of diff |
+| `--source-dir` (multiple) | Scope diff to specific directories |
+
+### For Developers
+
+| Extension point | How to extend |
+| --------------- | ------------- |
+| New metadata type handler | Most types are auto-resolved via SDR registry attributes (`adapter`, `decomposition`, `inFolder`, `xmlTag`+`key`). Only add an explicit entry to `handlerMap` in `TypeHandlerFactory` when a type needs behavior that differs from what SDR signals would select. |
+| New post-processor | Add a `BaseProcessor` subclass to `registeredProcessors` in `postProcessorManager.ts` |
+| Metadata type override | Add definition to `internalRegistry.ts` with special flags (`pruneOnly`, `excluded`, `xmlTag`, etc.) |
+| Programmatic API | `import sgd from 'sfdx-git-delta'` — call `await sgd(config)` directly, receiving the `Work` object |
+
+---
+
+## Key Types Reference
+
+### Config (`src/types/config.ts`)
+
+All user inputs flowing through the pipeline:
+
+| Field | Type | Description |
+| ----- | ---- | ----------- |
+| `from` / `to` | `string` | Git commit SHAs (the diff range) |
+| `mergeBase` | `boolean` | When true, resolves `from` to the merge base of `from`/`to` during config validation (`--merge-base` / `-b`) |
+| `output` | `string` | Directory for generated manifests |
+| `source` | `Pathspec[]` | Canonical, repository-relative source paths — `Pathspec` is a branded `string` (`src/utils/pathspec.ts`), so the serialised shape is unchanged |
+| `repo` | `string` | Git repository root |
+| `apiVersion` | `number` | Salesforce API version |
+| `generateDelta` | `boolean` | Whether to copy files under --output-dir; never changes manifest content |
+| `ignore` / `ignoreDestructive` | `string` | Gitignore-style filter file paths |
+| `include` / `includeDestructive` | `string` | Force-include file paths |
+| `ignoreWhitespace` | `boolean` | Skip whitespace-only changes |
+
+### RunContext (`src/types/runContext.ts`)
+
+Read-only context handed to every reader of a run: `config`, `metadata`, `trees` (the revision tree readers), `unions` and `parentDiffs`. `unions` is a `UnionOutcomes` (`ReadonlyMap<path, DiffOutcome>`) computed by `PureMoveResolver`; `NO_UNIONS` is the empty map, and `withRevisions` resets it for the include passes since they do not run on the diff the outcomes were computed on. `parentDiffs` is replaced by `withRevisions` alongside `unions`, for the same reason, and is the one internally mutable collaborator of the context: its memo fills as handlers ask, while the field itself is never reassigned.
+
+### MoveResolution (`src/utils/pureMoveResolver.ts`)
+
+`{ lines, unions, skipCause }`: the diff lines left after dropping pure-move additions, the union outcomes for the handlers, and why the check could not run (`undefined` when it ran).
+
+### Work (`src/types/work.ts`)
+
+Terminal value object — the pipeline's return type, constructed exactly once at the end of `main()` from already-folded values. Nothing writes into it after construction:
+
+| Field | Type | Description |
+| ----- | ---- | ----------- |
+| `config` | `Config` | The configuration |
+| `changes` | `ChangeSet` | The final read model, built once by `ChangeSet.from(keptElements, corroboratedRenames(keptElements, renameTriples))` in `assembleChanges()`. Views (`forPackageManifest`, `forDestructiveManifest`, `byChangeKind`) are pure projections. |
+| `warnings` | `readonly Error[]` | Non-fatal warnings, concatenated in the order they were produced: config warnings, then handler+collector warnings, then post-processor warnings, then unmatched-source-scope warnings, then the skipped-move-check warning, then the tree-index-unavailable warning |
+
+### HandlerResult (`src/types/handlerResult.ts`)
+
+Universal handler/collector output — a flat, readonly description of what the producer contributed, never a container shared with anyone else:
+
+| Field | Type | Description |
+| ----- | ---- | ----------- |
+| `elements` | `readonly ManifestElement[]` | The `{target, type, member, changeKind}` entries this handler/collector produced |
+| `copies` | `readonly CopyOperation[]` | `GitCopy`, `GitComponentCopy`, `GitTypeDirCompanionCopy`, `GitDirCopy`, `StreamedContent`, or `AugmentedContent` operations |
+| `warnings` | `readonly Error[]` | Non-fatal warnings |
+
+`emptyResult()` and `mergeResults(...results)` (both in `src/types/handlerResult.ts`) are the two module-level helpers: `emptyResult()` is a factory returning a fresh empty value, and `mergeResults` concatenates each axis across multiple results — a plain array `flatMap`, with no index structure to rebuild.
+
+### Metadata (`src/schemas/metadata.ts`)
+
+Metadata type definition (Zod-validated):
+
+| Field | Type | Description |
+| ----- | ---- | ----------- |
+| `xmlName` | `string` | Salesforce API type name |
+| `suffix` | `string` | File extension without dot |
+| `directoryName` | `string` | Expected parent directory |
+| `metaFile` | `boolean` | Companion `-meta.xml` exists |
+| `inFolder` | `boolean` | Folder-based organization |
+| `content` | `Metadata[]` | Sub-types sharing the directory |
+| `xmlTag` + `key` | `string` | In-file diff semantics |
+| `adapter` | `string` | SDR `strategies.adapter` — drives handler auto-resolution |
+| `decomposition` | `string` | SDR `strategies.decomposition` — child type heuristics |
+| `pruneOnly` | `boolean` | Only in destructiveChanges |
+| `excluded` | `boolean` | Not independently packageable |

@@ -1,17 +1,15 @@
 'use strict'
 import { LABEL_DECOMPOSED_SUFFIX } from '../constant/metadataConstants.js'
-import { log } from '../utils/LoggingDecorator.js'
+import type { HandlerResult } from '../types/handlerResult.js'
 import InFileHandler from './inFileHandler.js'
 import StandardHandler from './standardHandler.js'
 
 export default class CustomLabelHandler extends InFileHandler {
-  @log
-  public override async handleAddition() {
+  public override async collectAddition(): Promise<HandlerResult> {
     if (this._isDecomposed()) {
-      await StandardHandler.prototype.handleAddition.apply(this)
-    } else {
-      await super.handleAddition()
+      return await StandardHandler.prototype.collectAddition.call(this)
     }
+    return await super.collectAddition()
   }
 
   protected override _shouldTreatDeletionAsDeletion() {
@@ -30,12 +28,16 @@ export default class CustomLabelHandler extends InFileHandler {
     return true
   }
 
-  protected override _shouldTreatContainerType() {
-    // There is no container / parent type for Contained CustomLabels
+  // Stryker disable next-line BlockStatement -- equivalent: returning undefined is falsy, identical to returning false in the if-check that consumes this method
+  protected override _collectsContainer() {
     return false
   }
 
+  public override comparesElements(): boolean {
+    return !this._isDecomposed()
+  }
+
   protected _isDecomposed() {
-    return this.ext === LABEL_DECOMPOSED_SUFFIX
+    return this.element.extension === LABEL_DECOMPOSED_SUFFIX
   }
 }

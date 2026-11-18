@@ -1,20 +1,30 @@
 'use strict'
 
-import { MetadataRepository } from '../metadata/MetadataRepository.js'
 import type { Config } from '../types/config.js'
-import type { Work } from '../types/work.js'
+import type { HandlerResult } from '../types/handlerResult.js'
+import { emptyResult } from '../types/handlerResult.js'
+import type { RunContext } from '../types/runContext.js'
+import type ChangeSet from '../utils/changeSet.js'
 
-export default class BaseProcessor {
-  protected readonly config: Config
+export type ProcessorOutcome = Readonly<{ warnings: readonly Error[] }>
+export const emptyOutcome = (): ProcessorOutcome => ({ warnings: [] })
 
-  constructor(
-    protected readonly work: Work,
-    protected readonly metadata: MetadataRepository
-  ) {
-    this.config = work.config
+export default abstract class BaseProcessor {
+  constructor(protected readonly ctx: RunContext) {}
+
+  protected get config(): Config {
+    return this.ctx.config
   }
 
-  public async process() {
-    throw new Error('this class should be derived')
+  get isCollector(): boolean {
+    return false
+  }
+
+  public abstract process(changes: ChangeSet): Promise<ProcessorOutcome>
+
+  public async transformAndCollect(
+    _changes: ChangeSet
+  ): Promise<HandlerResult> {
+    return emptyResult()
   }
 }

@@ -1,18 +1,32 @@
 'use strict'
-import { describe, expect, it } from '@jest/globals'
+import { PassThrough } from 'node:stream'
+
+import { beforeAll, describe, expect, it } from 'vitest'
 
 import type { Config } from '../../../../src/types/config'
 import type { Manifest } from '../../../../src/types/work'
-import PackageBuilder, {
-  fillPackageWithParameter,
-} from '../../../../src/utils/packageHelper'
+import PackageBuilder from '../../../../src/utils/packageHelper'
+import { sourceDirs } from '../../../__utils__/sourceDirs'
+
+const buildToString = async (
+  builder: PackageBuilder,
+  manifest: Manifest
+): Promise<string> => {
+  const stream = new PassThrough()
+  const chunks: Buffer[] = []
+  stream.on('data', chunk => chunks.push(Buffer.from(chunk)))
+  await builder.buildPackageStream(manifest, stream)
+  stream.end()
+  return Buffer.concat(chunks).toString('utf8')
+}
 
 const config: Config = {
   apiVersion: 46,
   to: '',
   from: '',
+  mergeBase: false,
   output: '',
-  source: [''],
+  source: sourceDirs('.'),
   ignore: '',
   ignoreDestructive: '',
   repo: '',
@@ -72,14 +86,14 @@ const tests = [
     `<?xml version="1.0" encoding="UTF-8"?>
 <Package xmlns="http://soap.sforce.com/2006/04/metadata">
     <types>
+        <members>Field</members>
+        <name>CustomField</name>
+    </types>
+    <types>
         <members>Object</members>
         <members>OtherObject</members>
         <members>YetAnotherObject</members>
         <name>CustomObject</name>
-    </types>
-    <types>
-        <members>Field</members>
-        <name>CustomField</name>
     </types>
     <types>
         <members>Dashboard</members>
@@ -118,44 +132,100 @@ const tests = [
   ],
 ]
 
-describe(`test if package builder`, () => {
-  let packageConstructor: PackageBuilder
+describe('Given a PackageBuilder', () => {
+  let sut: PackageBuilder
   beforeAll(async () => {
-    packageConstructor = new PackageBuilder(config)
+    sut = new PackageBuilder(config)
   })
 
-  it.each(tests)('can build %s manifest', (_, diff, expected) => {
-    expect(packageConstructor.buildPackage(diff as Manifest)).toBe(expected)
+  it.each(tests)('can build %s manifest', async (_, diff, expected) => {
+    const out = await buildToString(sut, diff as Manifest)
+    expect(out).toBe(expected)
   })
-})
 
-describe('fillPackageWithParameter', () => {
-  describe('when called with proper params', () => {
-    const type = 'test-type'
-    const member = 'test-name'
-    describe.each([
-      [new Map(), 'is empty'],
-      [new Map([['other-type', new Set(['other-name'])]]), 'is not empty'],
-      [new Map([[type, new Set()]]), 'contains the type'],
-      [
-        new Map([[type, new Set([member])]]),
-        'contains the type and the element',
-      ],
-    ])('when the package %o  %s', store => {
-      it('adds the element name under the type in the package', () => {
-        // Arrange
-        const params = {
-          store,
-          type: type,
-          member,
-        }
+  describe('member sort order uses fr locale collation', () => {
+    it('When members include accented chars (À), Then they sort before uppercase ASCII A under fr locale', async () => {
+      // Arrange — 'À' (U+00C0) sorts before 'A' in French locale (fr)
+      // because the primary letter is treated as 'A' and the accent is a
+      // secondary difference that makes it sort first in fr collation.
+      // If the locale string were mutated to '' the sort order could differ.
+      const manifest = new Map([
+        ['ApexClass', new Set(['Zebra', 'Alpha', 'ÀAccented', 'Beta'])],
+      ])
 
-        // Act
-        fillPackageWithParameter(params)
+      // Act
+      const out = await buildToString(sut, manifest)
 
-        // Assert
-        expect(store.get(type).has(member)).toBeTruthy()
-      })
+      // Assert — ÀAccented must appear before Alpha under fr collation
+      const membersSection = out
+        .split('<name>')[0]
+        .split('<members>')
+        .filter(Boolean)
+        .map(s => s.split('</members>')[0].trim())
+      const idxAccented = membersSection.indexOf('ÀAccented')
+      const idxAlpha = membersSection.indexOf('Alpha')
+      expect(idxAccented).toBeGreaterThanOrEqual(0)
+      expect(idxAlpha).toBeGreaterThanOrEqual(0)
+      expect(idxAccented).toBeLessThan(idxAlpha)
+    })
+
+    it('When types include CustomObject, Then it is sorted alphabetically like the other types', async () => {
+      // Arrange — the CLI (SDR) rebuilds the manifest in plain alphabetical
+      // type order, so CustomObject gets no special placement.
+      const manifest = new Map([
+        ['CustomField', new Set(['Qux'])],
+        ['CustomObject', new Set(['Bar'])],
+        ['Workflow', new Set(['Baz'])],
+        ['ApexClass', new Set(['Foo'])],
+      ])
+
+      // Act
+      const out = await buildToString(sut, manifest)
+
+      // Assert
+      const typeNames = [...out.matchAll(/<name>(\w+)<\/name>/g)].map(
+        ([, name]) => name
+      )
+      expect(typeNames).toEqual([
+        'ApexClass',
+        'CustomField',
+        'CustomObject',
+        'Workflow',
+      ])
+    })
+  })
+
+  describe('member names containing XML-special characters', () => {
+    it('When member names contain & < >, Then they are escaped so the manifest is valid XML', async () => {
+      // Arrange — names arrive raw from the diff handlers / filesystem:
+      // a CustomLabel, a report folder, an email template with markup.
+      const manifest = new Map([
+        [
+          'CustomLabel',
+          new Set(['R&D_Label', 'Sales & Marketing', 'Quote <Final>']),
+        ],
+      ])
+
+      // Act
+      const out = await buildToString(sut, manifest)
+
+      // Assert — & < > escaped; no raw special char leaks into element text
+      expect(out).toContain('<members>R&amp;D_Label</members>')
+      expect(out).toContain('<members>Sales &amp; Marketing</members>')
+      expect(out).toContain('<members>Quote &lt;Final&gt;</members>')
+      expect(out).not.toContain('<members>R&D_Label</members>')
+      expect(out).not.toContain('<members>Quote <Final></members>')
+    })
+
+    it('When member names contain quotes, Then quotes are preserved (valid in element text)', async () => {
+      // Arrange
+      const manifest = new Map([['ApexClass', new Set([`O'Brien "VIP"`])]])
+
+      // Act
+      const out = await buildToString(sut, manifest)
+
+      // Assert — quotes are valid unescaped in element text; only & < > are escaped
+      expect(out).toContain(`<members>O'Brien "VIP"</members>`)
     })
   })
 })

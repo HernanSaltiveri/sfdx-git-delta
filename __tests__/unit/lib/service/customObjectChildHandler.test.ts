@@ -1,13 +1,18 @@
 'use strict'
+import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { MetadataRepository } from '../../../../src/metadata/MetadataRepository'
+import { getDefinition } from '../../../../src/metadata/metadataManager'
 import CustomObjectChildHandler from '../../../../src/service/customObjectChildHandler'
-import type { Work } from '../../../../src/types/work'
-import { copyFiles, readPathFromGit } from '../../../../src/utils/fsHelper'
-import { getGlobalMetadata, getWork } from '../../../__utils__/globalTestHelper'
+import type { Config } from '../../../../src/types/config'
+import {
+  CopyOperationKind,
+  ManifestTarget,
+} from '../../../../src/types/handlerResult'
+import { elementsOf } from '../../../__utils__/handlerResultView'
+import { createElement } from '../../../__utils__/testElement'
+import { getConfig, getContext } from '../../../__utils__/testWork'
 
-jest.mock('../../../../src/utils/fsHelper')
-
-const mockedReadPathFromGit = jest.mocked(readPathFromGit)
+vi.mock('../../../../src/utils/fsHelper')
 
 const objectType = {
   directoryName: 'recordTypes',
@@ -20,60 +25,79 @@ const objectType = {
 const line =
   'A       force-app/main/default/objects/Account/recordTypes/awesome.recordType-meta.xml'
 
-let work: Work
+let config: Config
 beforeEach(() => {
-  jest.clearAllMocks()
-  work = getWork()
+  vi.clearAllMocks()
+  config = getConfig()
 })
 
-describe('CustomFieldHandler', () => {
+describe('CustomObjectChildHandler', () => {
   let globalMetadata: MetadataRepository
   beforeAll(async () => {
-    globalMetadata = await getGlobalMetadata()
+    globalMetadata = await getDefinition({})
   })
 
-  describe('when called with generateDelta false', () => {
-    it('should not handle master detail exception', async () => {
+  describe('collect', () => {
+    it('Given record type addition, When collect, Then returns qualified element name in manifest', async () => {
       // Arrange
-      work.config.generateDelta = false
-      const sut = new CustomObjectChildHandler(
+      const { changeType, element } = createElement(
         line,
         objectType,
-        work,
         globalMetadata
+      )
+      const sut = new CustomObjectChildHandler(
+        changeType,
+        element,
+        getContext({ config })
       )
 
       // Act
-      await sut.handleAddition()
+      const result = await sut.collect()
 
       // Assert
-      expect(copyFiles).not.toHaveBeenCalled()
-      expect(work.diffs.package.get('RecordType')).toEqual(
-        new Set(['Account.awesome'])
+      expect(elementsOf(result)).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            target: ManifestTarget.Package,
+            type: 'RecordType',
+            member: 'Account.awesome',
+          }),
+        ])
       )
+      expect(
+        result.copies.some(c => c.kind === CopyOperationKind.GitCopy)
+      ).toBe(true)
+      expect(result.warnings).toHaveLength(0)
     })
-  })
-  describe('when called with generateDelta true', () => {
-    describe(`when field is not master detail`, () => {
-      it('should not handle master detail exception', async () => {
-        // Arrange
-        mockedReadPathFromGit.mockResolvedValueOnce('')
-        const sut = new CustomObjectChildHandler(
-          line,
-          objectType,
-          work,
-          globalMetadata
-        )
 
-        // Act
-        await sut.handleAddition()
+    it('Given record type deletion, When collect, Then returns qualified name in destructiveChanges', async () => {
+      // Arrange
+      const { changeType, element } = createElement(
+        'D       force-app/main/default/objects/Account/recordTypes/awesome.recordType-meta.xml',
+        objectType,
+        globalMetadata
+      )
+      const sut = new CustomObjectChildHandler(
+        changeType,
+        element,
+        getContext({ config })
+      )
 
-        // Assert
-        expect(copyFiles).toHaveBeenCalledTimes(1)
-        expect(work.diffs.package.get('RecordType')).toEqual(
-          new Set(['Account.awesome'])
-        )
-      })
+      // Act
+      const result = await sut.collect()
+
+      // Assert
+      expect(elementsOf(result)).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            target: ManifestTarget.DestructiveChanges,
+            type: 'RecordType',
+            member: 'Account.awesome',
+          }),
+        ])
+      )
+      expect(result.copies).toHaveLength(0)
+      expect(result.warnings).toHaveLength(0)
     })
   })
 })

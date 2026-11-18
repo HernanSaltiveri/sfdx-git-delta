@@ -1,86 +1,123 @@
-'use strict'
-import { describe, expect, it } from '@jest/globals'
-
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { MetadataRepositoryImpl } from '../../../../src/metadata/MetadataRepositoryImpl'
 import {
   getDefinition,
   getInFileAttributes,
   getLatestSupportedVersion,
   getSharedFolderMetadata,
-  isVersionSupported,
+  isPackable,
+  resetMetadataCache,
 } from '../../../../src/metadata/metadataManager'
+import { SDRMetadataAdapter } from '../../../../src/metadata/sdrMetadataAdapter'
+
 import type { Metadata } from '../../../../src/types/metadata'
+import * as fsUtils from '../../../../src/utils/fsUtils'
 
-describe(`test if metadata`, () => {
-  it('provide latest when apiVersion is undefined', async () => {
-    let undefinedVariable
-    const metadata = await getDefinition(undefinedVariable)
-    const latestVersionSupported = getLatestSupportedVersion()
-    const latestMetadataDef = await getDefinition(latestVersionSupported)
-
-    expect(metadata).toBeDefined()
-    expect(metadata).toEqual(latestMetadataDef)
-    expect(latestMetadataDef.get('classes')).toBeDefined()
-    expect(latestMetadataDef.get('do not exist')).toBeUndefined()
+describe('Given metadata definitions', () => {
+  beforeEach(() => {
+    resetMetadataCache()
   })
 
-  it('provide latest when apiVersion does not exist', async () => {
-    const metadata = await getDefinition(0)
-    const latestVersionSupported = getLatestSupportedVersion()
-    const latestMetadataDef = await getDefinition(latestVersionSupported)
+  describe('resetMetadataCache', () => {
+    it('When called, Then subsequent getInFileAttributes call recomputes from scratch', async () => {
+      // Arrange — populate the cache via getInFileAttributes, then reset.
+      const metadata = new MetadataRepositoryImpl([
+        {
+          directoryName: 'workflows.alerts',
+          inFolder: false,
+          metaFile: false,
+          xmlName: 'WorkflowAlert',
+          xmlTag: 'alerts',
+          key: 'fullName',
+        },
+      ])
+      const firstResult = getInFileAttributes(metadata)
+      // Verify cache is populated (same reference returned on second call)
+      expect(getInFileAttributes(metadata)).toBe(firstResult)
 
-    expect(metadata).toBeDefined()
-    expect(metadata).toEqual(latestMetadataDef)
-    expect(latestMetadataDef.get('classes')).toBeDefined()
-    expect(latestMetadataDef.get('do not exist')).toBeUndefined()
+      // Act
+      resetMetadataCache()
+
+      // Assert — after reset the function must recompute, producing a new Map
+      // object (different reference), proving the cache was cleared.
+      const afterReset = getInFileAttributes(metadata)
+      expect(afterReset).not.toBe(firstResult)
+      // Content must still be correct
+      expect(afterReset.has('alerts')).toBe(true)
+    })
+
+    it('When called, Then subsequent getSharedFolderMetadata call recomputes from scratch', async () => {
+      // Arrange
+      const metadata = new MetadataRepositoryImpl([
+        {
+          directoryName: 'discovery',
+          inFolder: false,
+          metaFile: true,
+          content: [{ suffix: 'model', xmlName: 'DiscoveryAIModel' }],
+        } as unknown as import('../../../../src/types/metadata').Metadata,
+      ])
+      const firstResult = getSharedFolderMetadata(metadata)
+      expect(getSharedFolderMetadata(metadata)).toBe(firstResult)
+
+      // Act
+      resetMetadataCache()
+
+      // Assert
+      const afterReset = getSharedFolderMetadata(metadata)
+      expect(afterReset).not.toBe(firstResult)
+      expect((afterReset as Map<string, string>).get('model')).toBe(
+        'DiscoveryAIModel'
+      )
+    })
   })
 
-  it('has classes', async () => {
-    const metadata = await getDefinition(58)
+  it('Given no config, When getDefinition, Then returns metadata with known types', async () => {
+    const metadata = await getDefinition({})
+
+    expect(metadata).toBeDefined()
     expect(metadata.get('classes')).toBeDefined()
+    expect(metadata.get('do not exist')).toBeUndefined()
   })
 
-  it('do not have do not exist', async () => {
-    let metadata = await getDefinition(48)
-    metadata = await getDefinition(46)
-    expect(metadata).toBeDefined()
-    expect(metadata.get('do not exist')).toBeFalsy()
+  describe('Given yaml paths and the default registry', () => {
+    it.each([
+      [
+        'force-app/main/default/externalServiceRegistrations/Svc.yaml',
+        'ExternalServiceRegistration',
+      ],
+      ['force-app/main/default/lwc/cmp/mock.yaml', 'LightningComponentBundle'],
+    ])('When resolving %s, Then it resolves to %s', async (path, xmlName) => {
+      // Arrange
+      const sut = await getDefinition({})
+
+      // Act
+      const result = sut.get(path)?.xmlName
+
+      // Assert
+      expect(result).toBe(xmlName)
+    })
+
+    it('When resolving a yaml outside any metadata directory, Then it is unresolved', async () => {
+      // Arrange
+      const sut = await getDefinition({})
+
+      // Act
+      const result = sut.get('ci.yaml')
+
+      // Assert
+      expect(result).toBeUndefined()
+    })
   })
 
-  it('getLatestSupportedVersion', () => {
-    const latestVersion = getLatestSupportedVersion()
-    expect(latestVersion).toBeDefined()
-    expect(latestVersion).toEqual(expect.any(Number))
-  })
-
-  it('latest supported version is the second last version', () => {
+  it('Given SDR returns version, When getLatestSupportedVersion, Then returns parsed number', async () => {
     // Arrange
-    let i = 45
+    vi.spyOn(SDRMetadataAdapter, 'getLatestApiVersion').mockResolvedValue('58')
 
-    // Act(s)
-    while (isVersionSupported(++i));
-    // Here latest version should not be supported because it is equal to last version + 1
+    // Act
+    const sut = await getLatestSupportedVersion()
 
     // Assert
-    const defaultLatestSupportedVersion = getLatestSupportedVersion()
-    // defaultLatestSupportedVersion should be equal to i + 1 (latest) + 1 (iteration)
-    expect(i).toBe(defaultLatestSupportedVersion + 2)
-  })
-
-  it('isVersionSupported', () => {
-    // Arrange
-    const dataSet = [
-      [40, false],
-      [46, true],
-      [52, true],
-      [55, true],
-    ]
-
-    // Act & Assert
-    for (const data of dataSet) {
-      const result = isVersionSupported(data[0] as number)
-      expect(result).toEqual(data[1])
-    }
+    expect(sut).toEqual(58)
   })
 
   it('getInFileAttributes', async () => {
@@ -109,6 +146,30 @@ describe(`test if metadata`, () => {
         key: 'other',
         excluded: true,
       },
+      {
+        directoryName: 'globalValueSetTranslations',
+        inFolder: false,
+        metaFile: false,
+        xmlName: 'GlobalValueSetTranslation',
+        xmlTag: 'globalValueSetTranslation',
+        key: 'fullName',
+      },
+      {
+        directoryName: 'none',
+        inFolder: false,
+        metaFile: false,
+        xmlName: 'ValueTranslation',
+        parentXmlName: 'GlobalValueSetTranslation',
+        xmlTag: 'valueTranslation',
+      },
+      {
+        directoryName: 'noXmlName',
+        inFolder: false,
+        metaFile: false,
+        // xmlName undefined
+        xmlTag: 'noXmlName',
+        key: 'fullName',
+      } as unknown as Metadata,
     ])
 
     // Act
@@ -128,12 +189,219 @@ describe(`test if metadata`, () => {
       key: 'other',
       excluded: true,
     })
+    expect(inFileAttributes.has('globalValueSetTranslation')).toBe(true)
+    expect(inFileAttributes.get('globalValueSetTranslation')).toEqual({
+      xmlName: 'GlobalValueSetTranslation',
+      key: 'fullName',
+      excluded: true,
+    })
+    expect(inFileAttributes.has('valueTranslation')).toBe(true)
+    expect(inFileAttributes.get('valueTranslation')).toEqual({
+      xmlName: 'ValueTranslation',
+      excluded: true,
+    })
+    expect(inFileAttributes.has('noXmlName')).toBe(true)
+    expect(inFileAttributes.get('noXmlName')).toEqual({
+      xmlName: undefined,
+      key: 'fullName',
+      excluded: false,
+    })
 
     // Act
     const otherInFileAttributes = getInFileAttributes(metadata)
 
     // Assert
     expect(otherInFileAttributes).toBe(inFileAttributes)
+  })
+
+  it('isPackable', () => {
+    // Arrange - populate the cache with test metadata
+    const metadata = new MetadataRepositoryImpl([
+      {
+        directoryName: 'workflows.alerts',
+        inFolder: false,
+        metaFile: false,
+        xmlName: 'WorkflowAlert',
+        xmlTag: 'alerts',
+        key: 'fullName',
+      },
+      {
+        directoryName: 'excluded',
+        inFolder: false,
+        metaFile: false,
+        xmlName: 'Excluded',
+        xmlTag: 'excluded',
+        key: 'other',
+        excluded: true,
+      },
+    ])
+    getInFileAttributes(metadata)
+
+    // Act & Assert
+    expect(isPackable('WorkflowAlert')).toBe(true)
+    expect(isPackable('Excluded')).toBe(false)
+    expect(isPackable('Unknown')).toBe(true)
+  })
+
+  it('getDefinition with additional registry', async () => {
+    const additionalRegistryContent = `[
+      {
+        "xmlName": "CustomThing",
+        "suffix": "thing",
+        "directoryName": "things",
+        "inFolder": false,
+        "metaFile": false
+      }
+    ]`
+    const readFileSpy = vi
+      .spyOn(fsUtils, 'readFile')
+      .mockResolvedValue(additionalRegistryContent)
+
+    const metadata = await getDefinition({
+      additionalMetadataRegistryPath: 'path/to/registry.json',
+    })
+    expect(
+      metadata.get('force-app/main/default/things/Alpha.thing')
+    ).toBeDefined()
+    expect(metadata.getByXmlName('CustomThing')).toBeDefined()
+    expect(readFileSpy).toHaveBeenCalledWith('path/to/registry.json')
+    readFileSpy.mockRestore()
+  })
+
+  it('getDefinition with invalid additional registry', async () => {
+    const additionalRegistryContent = 'invalid json'
+    const readFileSpy = vi
+      .spyOn(fsUtils, 'readFile')
+      .mockResolvedValue(additionalRegistryContent)
+
+    await expect(
+      getDefinition({
+        additionalMetadataRegistryPath: 'path/to/registry.json',
+      })
+    ).rejects.toThrow(
+      "Unable to parse the additional metadata registry file 'path/to/registry.json'. Caused by: SyntaxError: Unexpected token 'i', \"invalid json\" is not valid JSON"
+    )
+    readFileSpy.mockRestore()
+  })
+
+  it('Given additional registry is not an array, When getDefinition, Then throws validation error', async () => {
+    // Arrange
+    const additionalRegistryContent = '{"xmlName": "CustomThing"}'
+    const readFileSpy = vi
+      .spyOn(fsUtils, 'readFile')
+      .mockResolvedValue(additionalRegistryContent)
+
+    // Act & Assert
+    await expect(
+      getDefinition({
+        additionalMetadataRegistryPath: 'path/to/registry.json',
+      })
+    ).rejects.toThrow(/expected array, received object/i)
+    readFileSpy.mockRestore()
+  })
+
+  it('Given additional registry entry without required fields, When getDefinition, Then throws validation error', async () => {
+    // Arrange
+    const additionalRegistryContent = `[
+      {
+        "suffix": "thing"
+      }
+    ]`
+    const readFileSpy = vi
+      .spyOn(fsUtils, 'readFile')
+      .mockResolvedValue(additionalRegistryContent)
+
+    // Act & Assert
+    await expect(
+      getDefinition({
+        additionalMetadataRegistryPath: 'path/to/registry.json',
+      })
+    ).rejects.toThrow(
+      /Invalid additional metadata registry file.*xmlName.*directoryName.*inFolder.*metaFile/s
+    )
+    readFileSpy.mockRestore()
+  })
+
+  it('Given additional registry entry with wrong type, When getDefinition, Then throws validation error', async () => {
+    // Arrange
+    const additionalRegistryContent = `[
+      {
+        "xmlName": "CustomThing",
+        "directoryName": "things",
+        "inFolder": "not-a-boolean",
+        "metaFile": false
+      }
+    ]`
+    const readFileSpy = vi
+      .spyOn(fsUtils, 'readFile')
+      .mockResolvedValue(additionalRegistryContent)
+
+    // Act & Assert
+    await expect(
+      getDefinition({
+        additionalMetadataRegistryPath: 'path/to/registry.json',
+      })
+    ).rejects.toThrow(/expected boolean, received string/i)
+    readFileSpy.mockRestore()
+  })
+
+  it('Given additional registry entry with unknown field, When getDefinition, Then throws validation error', async () => {
+    // Arrange
+    const additionalRegistryContent = `[
+      {
+        "xmlName": "CustomThing",
+        "directoryName": "things",
+        "inFolder": false,
+        "metaFile": false,
+        "unknownField": "value"
+      }
+    ]`
+    const readFileSpy = vi
+      .spyOn(fsUtils, 'readFile')
+      .mockResolvedValue(additionalRegistryContent)
+
+    // Act & Assert
+    await expect(
+      getDefinition({
+        additionalMetadataRegistryPath: 'path/to/registry.json',
+      })
+    ).rejects.toThrow(/Unrecognized key.*unknownField/)
+    readFileSpy.mockRestore()
+  })
+
+  it('Given additional registry with nested path violation, When getDefinition, Then error message contains dotted path', async () => {
+    // Arrange — triggers the issue.path.join('.') path on L74. A nested Zod
+    // path like [0, 'inFolder'] serialises to "0.inFolder".
+    const additionalRegistryContent = `[
+      {
+        "xmlName": "CustomThing",
+        "directoryName": "things",
+        "inFolder": 123,
+        "metaFile": false
+      }
+    ]`
+    const readFileSpy = vi
+      .spyOn(fsUtils, 'readFile')
+      .mockResolvedValue(additionalRegistryContent)
+
+    // Act & Assert
+    let thrown: Error | undefined
+    try {
+      await getDefinition({
+        additionalMetadataRegistryPath: 'path/to/registry.json',
+      })
+    } catch (e) {
+      thrown = e as Error
+    } finally {
+      readFileSpy.mockRestore()
+    }
+    expect(thrown).toBeDefined()
+    // The error message must contain the dotted path (e.g. "0.inFolder")
+    // proving issue.path.join('.') ran and was included.
+    expect(thrown!.message).toMatch(/0\.inFolder/)
+    expect(thrown!.message).toContain(
+      "Invalid additional metadata registry file 'path/to/registry.json'"
+    )
   })
 
   it('getSharedFolderMetadata', async () => {

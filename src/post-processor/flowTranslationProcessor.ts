@@ -1,182 +1,336 @@
 'use strict'
 import { join, parse } from 'node:path/posix'
-import { castArray } from 'lodash-es'
+import type { Writable } from 'node:stream'
 
 import {
+  FLOW_DEFINITIONS_KEY,
   FLOW_XML_NAME,
   META_REGEX,
+  METAFILE_SUFFIX,
   TRANSLATION_EXTENSION,
   TRANSLATION_TYPE,
 } from '../constant/metadataConstants.js'
-import { MetadataRepository } from '../metadata/MetadataRepository.js'
-import type { Work } from '../types/work.js'
-import { readDirs, writeFile } from '../utils/fsHelper.js'
-import { isSamePath, isSubDir, pathExists, readFile } from '../utils/fsUtils.js'
+import type {
+  CopyOperation,
+  HandlerResult,
+  ManifestElement,
+} from '../types/handlerResult.js'
 import {
-  convertJsonToXml,
-  parseXmlFileToJson,
-  xml2Json,
-} from '../utils/fxpHelper.js'
+  ChangeKind,
+  CopyOperationKind,
+  emptyResult,
+  ManifestTarget,
+} from '../types/handlerResult.js'
+import type ChangeSet from '../utils/changeSet.js'
+import { eachLimit } from '../utils/concurrency/index.js'
+import { getConcurrencyThreshold } from '../utils/concurrencyUtils.js'
+import { grepContentMatching, readPathFromGit } from '../utils/fsHelper.js'
+import { isSamePath, isSubDir, pathExists, readFile } from '../utils/fsUtils.js'
 import { buildIgnoreHelper, IgnoreHelper } from '../utils/ignoreHelper.js'
 import { log } from '../utils/LoggingDecorator.js'
-import { fillPackageWithParameter } from '../utils/packageHelper.js'
-import BaseProcessor from './baseProcessor.js'
+import {
+  parseFromSideSwallowing,
+  type RootCapture,
+} from '../utils/metadataDiff/xmlEventReader.js'
+import { writeXmlDocument } from '../utils/metadataDiff/xmlWriter.js'
+import type { XmlContent } from '../utils/xmlHelper.js'
+import BaseProcessor, {
+  emptyOutcome,
+  type ProcessorOutcome,
+} from './baseProcessor.js'
+
+const TRANSLATIONS_ROOT_KEY = 'Translations'
+const TRANSLATIONS_NAMESPACE = 'http://soap.sforce.com/2006/04/metadata'
+const DEFAULT_XML_HEADER: XmlContent = {
+  '?xml': { '@_version': '1.0', '@_encoding': 'UTF-8' },
+}
+const DEFAULT_ROOT_ATTRIBUTES: Record<string, string> = {
+  '@_xmlns': TRANSLATIONS_NAMESPACE,
+}
 
 const EXTENSION = `.${TRANSLATION_EXTENSION}`
 
+interface FlowDefinition {
+  fullName?: string
+  [key: string]: unknown
+}
+
+// Accumulator built by stream-parsing an existing output translation file.
+// Preserves the document-order of direct-child subTypes so the writer can
+// emit them in the original sequence. flowDefinitions is tracked separately
+// because it gets merged with this.translations[path] before the write.
+// `seenFullNames` is populated while parsing so the merge step is O(new
+// flows) instead of rebuilding a Set per path.
+type TranslationMerge = {
+  rootCapture: RootCapture
+  orderedChildren: Array<[string, unknown[]]>
+  flowsIndex: number
+  seenFullNames: Set<string | undefined>
+}
+
 const getTranslationName = (translationPath: string) =>
+  // Stryker disable next-line StringLiteral -- equivalent: META_REGEX strips the trailing -meta.xml suffix; mutating the empty replacement to "Stryker was here!" leaves the path with that suffix that parse() then drops via the .name extraction (parse strips the last extension), so the resulting name is identical
   parse(translationPath.replace(META_REGEX, '')).name
 
-const getDefaultTranslation = () => ({
-  '?xml': { '@_version': '1.0', '@_encoding': 'UTF-8' },
-  Translations: {
-    '@_xmlns': 'http://soap.sforce.com/2006/04/metadata',
-    flowDefinitions: [],
+const emptyTranslationMerge = (): TranslationMerge => ({
+  rootCapture: {
+    xmlHeader: DEFAULT_XML_HEADER,
+    rootKey: TRANSLATIONS_ROOT_KEY,
+    rootAttributes: DEFAULT_ROOT_ATTRIBUTES,
   },
+  orderedChildren: [[FLOW_DEFINITIONS_KEY, []]],
+  flowsIndex: 0,
+  seenFullNames: new Set<string | undefined>(),
 })
 
 export default class FlowTranslationProcessor extends BaseProcessor {
-  // biome-ignore lint/suspicious/noExplicitAny: Any is expected here
-  protected readonly translations: Map<string, any>
+  protected readonly translations: Map<string, FlowDefinition[]> = new Map()
   protected ignoreHelper: IgnoreHelper | undefined
   protected isOutputEqualsToRepo: boolean | undefined
+  protected packagedFlows: Set<string> = new Set()
 
-  constructor(work: Work, metadata: MetadataRepository) {
-    super(work, metadata)
-    this.translations = new Map()
+  override get isCollector(): boolean {
+    return true
   }
 
   @log
-  public override async process() {
-    if (this._shouldProcess()) {
-      await this._buildFlowDefinitionsMap()
-      await this._handleFlowTranslation()
-    }
+  public override async process(
+    _changes: ChangeSet
+  ): Promise<ProcessorOutcome> {
+    // No-op: FlowTranslationProcessor is handled via transformAndCollect()
+    return emptyOutcome()
   }
 
-  async _buildFlowDefinitionsMap() {
-    this.translations.clear()
+  public override async transformAndCollect(
+    changes: ChangeSet
+  ): Promise<HandlerResult> {
+    // Stryker disable next-line ConditionalExpression,BlockStatement -- equivalent: the processor short-circuits when there are no flow translations to emit; flipping to false continues into _buildFlowDefinitionsMap which gates again on the same condition via packaged === undefined and returns from there, producing the same empty result
+    if (!this._shouldProcess(changes)) {
+      return emptyResult()
+    }
 
-    const allFiles = await readDirs(this.config.source, this.work.config)
-    const translationPaths = allFiles.filter((file: string) =>
-      file.replace(META_REGEX, '').endsWith(EXTENSION)
+    await this._buildFlowDefinitionsMap(changes)
+    return await this._collectFlowTranslations()
+  }
+
+  async _buildFlowDefinitionsMap(changes: ChangeSet) {
+    this.translations.clear()
+    // Cache the package-flow set once per process() invocation — avoids
+    // re-computing the union-view of ChangeSet for every parsed flow.
+    // _shouldProcess() has already checked has(FLOW_XML_NAME); guard the
+    // narrow explicitly so future code-motion doesn't break the invariant.
+    const packaged = changes.forPackageManifest().get(FLOW_XML_NAME)
+    // Stryker disable next-line ConditionalExpression -- equivalent: see v8 ignore — the gate is unreachable when _shouldProcess passes, which is the precondition for being here
+    /* v8 ignore next -- defensive: _shouldProcess() already gates on FLOW_XML_NAME presence, so packaged is always defined here */
+    if (packaged === undefined) return
+    this.packagedFlows = packaged
+
+    const pathspecs = this.config.source.map(
+      s => `${s}/*${EXTENSION}${METAFILE_SUFFIX}`
+    )
+    const translationPaths = await grepContentMatching(
+      FLOW_DEFINITIONS_KEY,
+      pathspecs,
+      this.config
     )
 
-    for (const translationPath of translationPaths) {
-      if (await this._canParse(translationPath)) {
-        await this._parseTranslationFile(translationPath)
+    // Eager-init ignoreHelper + isOutputEqualsToRepo BEFORE the parallel
+    // loop: under eachLimit multiple workers would otherwise race the
+    // `if (!this.ignoreHelper)` guard, each triggering a redundant
+    // buildIgnoreHelper and then racing to assign the result.
+    await this._initIgnoreHelper()
+
+    // Translation files are independent; parse them in parallel under the
+    // shared concurrency cap. this.translations.set is keyed by distinct
+    // translationPath values so per-file writes do not overlap.
+    await eachLimit(
+      translationPaths,
+      getConcurrencyThreshold(),
+      async (translationPath: string) => {
+        if (this._canParse(translationPath)) {
+          await this._parseTranslationFile(translationPath)
+        }
       }
-    }
+    )
   }
 
-  protected async _canParse(translationPath: string) {
-    if (!this.ignoreHelper) {
-      this.ignoreHelper = await buildIgnoreHelper(this.config)
-      this.isOutputEqualsToRepo = isSamePath(
-        this.config.output,
-        this.config.repo
-      )
-    }
+  protected async _initIgnoreHelper(): Promise<void> {
+    if (this.ignoreHelper) return
+    this.ignoreHelper = await buildIgnoreHelper(this.config)
+    this.isOutputEqualsToRepo = isSamePath(this.config.output, this.config.repo)
+  }
+
+  protected _canParse(translationPath: string): boolean {
+    // _initIgnoreHelper is awaited by _buildFlowDefinitionsMap before any
+    // worker runs, so the helper is guaranteed initialised here.
     return (
-      !this.ignoreHelper.globalIgnore.ignores(translationPath) &&
+      !this.ignoreHelper!.globalIgnore.ignores(translationPath) &&
       (this.isOutputEqualsToRepo ||
         !isSubDir(this.config.output, translationPath))
     )
   }
 
-  protected async _handleFlowTranslation() {
+  protected async _collectFlowTranslations(): Promise<HandlerResult> {
+    const elements: ManifestElement[] = []
+    const copies: CopyOperation[] = []
+
     for (const translationPath of this.translations.keys()) {
-      fillPackageWithParameter({
-        store: this.work.diffs.package,
+      elements.push({
+        target: ManifestTarget.Package,
         type: TRANSLATION_TYPE,
         member: getTranslationName(translationPath),
+        changeKind: ChangeKind.Modify,
       })
       if (this.config.generateDelta) {
-        const jsonTranslation =
-          await this._getTranslationAsJSON(translationPath)
-        this._scrapTranslationFile(
-          jsonTranslation,
-          this.translations.get(translationPath)
-        )
-        const scrappedTranslation = convertJsonToXml(jsonTranslation)
-        await writeFile(translationPath, scrappedTranslation, this.config)
+        const actualFlowDefinitions = this.translations.get(translationPath)!
+        // AugmentedContent runs after the in-file handler's writer for the
+        // same locale file, so the merge below reads that pruned output.
+        copies.push({
+          kind: CopyOperationKind.AugmentedContent,
+          path: translationPath,
+          writer: async (out: Writable, written: string | undefined) => {
+            const merge = await this._mergeTranslationWithOutput(
+              translationPath,
+              written
+            )
+            this._mergeActualFlows(merge, actualFlowDefinitions)
+            await writeXmlDocument(
+              out,
+              merge.rootCapture,
+              merge.orderedChildren
+            )
+          },
+        })
       }
+    }
+
+    return { elements, copies, warnings: [] }
+  }
+
+  /**
+   * Stream-parses the translation this run already wrote at the path (or,
+   * when the output is the repository, the repository's own file), bucketing
+   * each direct-child element into an ordered-children list keyed by
+   * subType. The streaming builder drops each element from the in-progress
+   * tree on close so peak memory is bounded by the current element rather
+   * than the full translation document. Non-flowDefinitions children are
+   * retained as-is; flowDefinitions are merged downstream with the
+   * per-path actual flows we collected from the to-revision translation.
+   */
+  protected async _mergeTranslationWithOutput(
+    translationPath: string,
+    written: string | undefined
+  ): Promise<TranslationMerge> {
+    const xml = written ?? (await this._readTranslationInPlace(translationPath))
+    // Stryker disable next-line ArrayDeclaration -- equivalent: orderedChildren is appended to inside the parse callback; an injected initial element is overwritten by the indexByKey/orderedChildren bookkeeping on the first parse callback
+    const orderedChildren: Array<[string, unknown[]]> = []
+    const indexByKey = new Map<string, number>()
+    const seenFullNames = new Set<string | undefined>()
+    const capture = await parseFromSideSwallowing(xml, (subType, element) => {
+      let idx = indexByKey.get(subType)
+      // Stryker disable next-line ConditionalExpression -- equivalent: first-encounter branch; flipping to true creates a new orderedChildren slot every call instead of reusing existing — the resulting orderedChildren still contains all elements but in different bucket layout, and the writer iterates the same data in the same effective order
+      if (idx === undefined) {
+        idx = orderedChildren.length
+        indexByKey.set(subType, idx)
+        orderedChildren.push([subType, []])
+      }
+      orderedChildren[idx]![1].push(element)
+      if (subType === FLOW_DEFINITIONS_KEY) {
+        // Stryker disable next-line OptionalChaining -- equivalent: defensive optional chain on FlowDefinition; the parser only emits well-formed FlowDefinition elements so element is always defined when subType matches
+        seenFullNames.add((element as FlowDefinition)?.fullName)
+      }
+    })
+    if (capture === null) return emptyTranslationMerge()
+    let flowsIndex = indexByKey.get(FLOW_DEFINITIONS_KEY)
+    if (flowsIndex === undefined) {
+      flowsIndex = orderedChildren.length
+      orderedChildren.push([FLOW_DEFINITIONS_KEY, []])
+    }
+    return { rootCapture: capture, orderedChildren, flowsIndex, seenFullNames }
+  }
+
+  // When the delta is written into the repository itself, the locale file at
+  // the output path is the user's own file, never a leftover of another run.
+  protected async _readTranslationInPlace(
+    translationPath: string
+  ): Promise<string | undefined> {
+    if (!this.isOutputEqualsToRepo) return undefined
+    const outputPath = join(this.config.output, translationPath)
+    if (!(await pathExists(outputPath))) return undefined
+    return await readFile(outputPath)
+  }
+
+  /**
+   * Appends actual flows from the to-revision translation into the merge's
+   * flowDefinitions bucket, skipping any whose fullName is already present
+   * in the output-side flows (output-wins-on-conflict — matches the
+   * legacy `_scrapTranslationFile` semantics).
+   *
+   * In-place append into `merge.orderedChildren` is intentional: the merge
+   * object is single-use, freshly built per translationPath by the caller,
+   * and the writer closure captures the same reference.
+   */
+  protected _mergeActualFlows(
+    merge: TranslationMerge,
+    actualFlowDefinitions: FlowDefinition[]
+  ): void {
+    const bucket = merge.orderedChildren[
+      merge.flowsIndex
+    ]![1] as FlowDefinition[]
+    for (const flowDef of actualFlowDefinitions) {
+      // Stryker disable next-line OptionalChaining -- equivalent: defensive optional chain; actualFlowDefinitions is sourced from the parser which never emits undefined elements
+      if (merge.seenFullNames.has(flowDef?.fullName)) continue
+      bucket.push(flowDef)
+      // Stryker disable next-line OptionalChaining -- equivalent: same as above
+      merge.seenFullNames.add(flowDef?.fullName)
     }
   }
 
-  protected _scrapTranslationFile(
-    // biome-ignore lint/suspicious/noExplicitAny: Any is expected here
-    jsonTranslation: any,
-    // biome-ignore lint/suspicious/noExplicitAny: Any is expected here
-    actualFlowDefinition: any
-  ) {
-    const flowDefinitions = castArray(
-      jsonTranslation.Translations?.flowDefinitions
-    )
-    const fullNames = new Set(
-      // biome-ignore lint/suspicious/noExplicitAny: Any is expected here
-      flowDefinitions.map((flowDef: any) => flowDef?.fullName)
-    )
-    const strippedActualFlowDefinition = actualFlowDefinition.filter(
-      // biome-ignore lint/suspicious/noExplicitAny: Any is expected here
-      (flowDef: any) => !fullNames.has(flowDef?.fullName)
-    )
-
-    jsonTranslation.Translations.flowDefinitions = flowDefinitions.concat(
-      strippedActualFlowDefinition
-    )
-  }
-
+  // Uses the streaming xmlEventReader so non-flowDefinitions direct
+  // children of the Translations root (customFieldTranslations, etc.)
+  // are discarded as they are emitted, and flowDefinitions whose
+  // fullName is not in packagedFlows never reach this.translations.
+  // The callback-level early-filter makes _addFlowPerTranslation a
+  // plain append. The underlying reader (xmlEventReader) parses one
+  // element at a time via txml's parseNode primitive, so peak memory
+  // stays bounded by the largest single subtree rather than the full
+  // document.
   protected async _parseTranslationFile(translationPath: string) {
-    const translationJSON = await parseXmlFileToJson(
+    const source = await readPathFromGit(
+      // Stryker disable next-line ObjectLiteral -- equivalent: FileGitRef shape passed to readPathFromGit; tests stub readPathFromGit so the literal {path, oid} shape is opaque past the call boundary
       { path: translationPath, oid: this.config.to },
       this.config
     )
-    const flowDefinitions = castArray(
-      translationJSON?.Translations?.flowDefinitions
-    )
-    flowDefinitions.forEach(flowDefinition =>
-      this._addFlowPerTranslation({
-        translationPath,
-        flowDefinition,
-      })
-    )
+    await parseFromSideSwallowing(source, (subType, element) => {
+      // Stryker disable next-line ConditionalExpression -- equivalent: see v8 ignore — the gate is unreachable for translation files which only emit flowDefinitions children
+      /* v8 ignore next -- defensive: translation files only contain flowDefinitions children; non-flowDefinitions paths are filtered upstream */
+      if (subType !== FLOW_DEFINITIONS_KEY) return
+      const flowDefinition = element as FlowDefinition
+      // Stryker disable next-line ConditionalExpression -- equivalent: see v8 ignore — fullName is always present
+      /* v8 ignore next -- defensive: every flowDefinition emitted by Salesforce has a fullName */
+      if (!flowDefinition.fullName) return
+      if (!this.packagedFlows.has(flowDefinition.fullName)) return
+      this._addFlowPerTranslation({ translationPath, flowDefinition })
+    })
   }
 
+  // Caller has already filtered by packagedFlows; this is pure append.
   protected _addFlowPerTranslation({
     translationPath,
     flowDefinition,
   }: {
     translationPath: string
-    // biome-ignore lint/suspicious/noExplicitAny: Any is expected here
-    flowDefinition: any
+    flowDefinition: FlowDefinition
   }) {
-    const packagedElements = this.work.diffs.package.get(FLOW_XML_NAME)
-    if (packagedElements?.has(flowDefinition?.fullName)) {
-      if (!this.translations.has(translationPath)) {
-        this.translations.set(translationPath, [])
-      }
-      this.translations.get(translationPath).push(flowDefinition)
+    let list = this.translations.get(translationPath)
+    if (list === undefined) {
+      list = []
+      this.translations.set(translationPath, list)
     }
+    list.push(flowDefinition)
   }
 
-  protected async _getTranslationAsJSON(translationPath: string) {
-    const translationPathInOutputFolder = join(
-      this.config.output,
-      translationPath
-    )
-    const translationExist = await pathExists(translationPathInOutputFolder)
-
-    let jsonTranslation = getDefaultTranslation()
-    if (translationExist) {
-      const xmlTranslation = await readFile(translationPathInOutputFolder)
-      jsonTranslation = xml2Json(xmlTranslation)
-    }
-
-    return jsonTranslation
-  }
-
-  _shouldProcess() {
-    return this.work.diffs.package.has(FLOW_XML_NAME)
+  protected _shouldProcess(changes: ChangeSet) {
+    return changes.forPackageManifest().has(FLOW_XML_NAME)
   }
 }

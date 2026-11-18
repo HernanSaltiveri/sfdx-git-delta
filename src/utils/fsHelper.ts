@@ -1,39 +1,20 @@
 'use strict'
 import { join } from 'node:path/posix'
 
-import { outputFile } from 'fs-extra'
-
 import GitAdapter from '../adapter/GitAdapter.js'
 import type { Config } from '../types/config.js'
 import type { FileGitRef } from '../types/git.js'
+import type { RunContext } from '../types/runContext.js'
 
+import { getErrorMessage } from './errorUtils.js'
+import { outputFile } from './fsUtils.js'
 import { buildIgnoreHelper } from './ignoreHelper.js'
+import { Logger, lazy } from './LoggingService.js'
 
-const copiedFiles = new Set()
-const writtenFiles = new Set()
+const writtenFiles = new Set<string>()
 
-export const copyFiles = async (config: Config, src: string) => {
-  if (copiedFiles.has(src) || writtenFiles.has(src)) {
-    return
-  }
-  copiedFiles.add(src)
-
-  const ignoreHelper = await buildIgnoreHelper(config)
-  if (ignoreHelper.globalIgnore.ignores(src)) {
-    return
-  }
-  try {
-    const gitAdapter = GitAdapter.getInstance(config)
-    for await (const file of gitAdapter.getFilesFrom(src)) {
-      // Use Buffer to output the file content
-      // Let fs implementation detect the encoding ("utf8" or "binary")
-      const dst = join(config.output, file.path)
-      await outputFile(dst, file.content)
-      copiedFiles.add(dst)
-    }
-  } catch {
-    /* empty */
-  }
+export const resetWrittenFiles = (): void => {
+  writtenFiles.clear()
 }
 
 export const readPathFromGit = async (forRef: FileGitRef, config: Config) => {
@@ -41,23 +22,60 @@ export const readPathFromGit = async (forRef: FileGitRef, config: Config) => {
   try {
     const gitAdapter = GitAdapter.getInstance(config)
     utf8Data = await gitAdapter.getStringContent(forRef)
-  } catch {
-    /* empty */
+  } catch (error) {
+    Logger.debug(
+      // Stryker disable next-line StringLiteral,ArrowFunction -- equivalent: log content is observability only; tests assert on the empty-string return
+      lazy`readPathFromGit failed for ${forRef.path}: ${() => getErrorMessage(error)}`
+    )
   }
   return utf8Data
 }
 
-export const pathExists = async (path: string, config: Config) => {
-  const gitAdapter = GitAdapter.getInstance(config)
-  return await gitAdapter.pathExists(path)
-}
+// Both read the run-owned tree reader for `config.to` — supplied by the
+// caller (ultimately main.ts) rather than rebuilt here, so there is no
+// scope for this lookup to disagree with whatever scope the index was
+// actually built under. A revision nobody built an index for (or an index
+// build that failed) degrades to false/[] rather than indexing lazily.
+export const pathExists = async (
+  path: string,
+  ctx: RunContext
+): Promise<boolean> => ctx.trees.pathExists(ctx.config.to, path)
+
+export const fileExists = async (
+  path: string,
+  ctx: RunContext
+): Promise<boolean> => ctx.trees.fileExists(ctx.config.to, path)
 
 export const readDirs = async (
   paths: string | string[],
+  ctx: RunContext
+): Promise<string[]> => ctx.trees.filesUnder(ctx.config.to, paths)
+
+export const grepContentUnder = async (
+  pattern: string,
+  path: string | string[],
   config: Config
 ): Promise<string[]> => {
   const gitAdapter = GitAdapter.getInstance(config)
-  return await gitAdapter.getFilesPath(paths)
+  return await gitAdapter.grepUnderPaths(pattern, path, config.to)
+}
+
+export const grepContentMatching = async (
+  pattern: string,
+  pathspecs: string | string[],
+  config: Config
+): Promise<string[]> => {
+  const gitAdapter = GitAdapter.getInstance(config)
+  return await gitAdapter.grepMatchingPathspecs(pattern, pathspecs, config.to)
+}
+
+export const contentIncludes = async (
+  pattern: string,
+  path: string,
+  config: Config
+): Promise<boolean> => {
+  const results = await grepContentUnder(pattern, path, config)
+  return results.length > 0
 }
 
 export const writeFile = async (

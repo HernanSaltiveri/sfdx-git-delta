@@ -1,0 +1,220 @@
+---
+name: Dependabot Auto-Merge
+
+on: pull_request
+
+permissions:
+  contents: write
+  pull-requests: write
+
+# A dependabot rebase restarts the pipeline; the stale one must not merge.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  # 1. Bump: diff SDR's registry, sync the internal one, retitle, approve.
+  dependabot:
+    runs-on: ubuntu-latest
+    if: github.actor == 'dependabot[bot]'
+    outputs:
+      registry_changed: ${{ steps.registry-check.outputs.registry_changed }}
+      head_sha: ${{ steps.push.outputs.head_sha }}
+    steps:
+      - name: Dependabot metadata
+        id: metadata
+        uses: dependabot/fetch-metadata@v3
+        with:
+          github-token: "${{ secrets.GITHUB_TOKEN }}"
+
+      - name: Checkout PR branch
+        if: steps.metadata.outputs.package-ecosystem == 'npm_and_yarn' && contains(steps.metadata.outputs.dependency-names, '@salesforce/source-deploy-retrieve')
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+          token: ${{ secrets.RELEASE_PAT }}
+
+      - name: Setup Node
+        if: steps.metadata.outputs.package-ecosystem == 'npm_and_yarn' && contains(steps.metadata.outputs.dependency-names, '@salesforce/source-deploy-retrieve')
+        uses: actions/setup-node@v7
+        with:
+          node-version: 'lts/*'
+
+      - name: Install dependencies
+        if: steps.metadata.outputs.package-ecosystem == 'npm_and_yarn' && contains(steps.metadata.outputs.dependency-names, '@salesforce/source-deploy-retrieve')
+        run: HUSKY=0 npm ci
+
+      - name: Build
+        if: steps.metadata.outputs.package-ecosystem == 'npm_and_yarn' && contains(steps.metadata.outputs.dependency-names, '@salesforce/source-deploy-retrieve')
+        run: npm run build
+
+      - name: Check if SDR metadata registry changed
+        id: registry-check
+        if: steps.metadata.outputs.package-ecosystem == 'npm_and_yarn' && contains(steps.metadata.outputs.dependency-names, '@salesforce/source-deploy-retrieve')
+        env:
+          OLD_VERSION: ${{ steps.metadata.outputs.previous-version }}
+          NEW_VERSION: ${{ steps.metadata.outputs.new-version }}
+        run: |
+          REGISTRY_PATH="lib/src/registry/metadataRegistry.json"
+
+          # Download old version tarball to extract its registry
+          TARBALL=$(npm pack "@salesforce/source-deploy-retrieve@${OLD_VERSION}" --pack-destination /tmp 2>/dev/null)
+          mkdir -p /tmp/sdr-old
+          tar -xzf "/tmp/${TARBALL}" -C /tmp/sdr-old
+
+          # Compare metadata registries
+          OLD_FILE="/tmp/sdr-old/package/${REGISTRY_PATH}"
+          NEW_FILE="node_modules/@salesforce/source-deploy-retrieve/${REGISTRY_PATH}"
+
+          if diff -q "$OLD_FILE" "$NEW_FILE" > /dev/null 2>&1; then
+            echo "registry_changed=false" >> "$GITHUB_OUTPUT"
+            echo "No metadata registry changes detected between SDR versions"
+            rm -rf /tmp/sdr-old "/tmp/${TARBALL}"
+            exit 0
+          fi
+
+          echo "registry_changed=true" >> "$GITHUB_OUTPUT"
+          echo "Metadata registry changes detected between SDR versions"
+
+          # Diff added top-level type API names
+          jq -r '.types[].name' "$OLD_FILE" | sort -u > /tmp/old-types.txt
+          jq -r '.types[].name' "$NEW_FILE" | sort -u > /tmp/new-types.txt
+          comm -23 /tmp/new-types.txt /tmp/old-types.txt > /tmp/added-types.txt
+
+          # Diff added child type API names with parent context (tab-separated: child<TAB>parent)
+          # shellcheck disable=SC2016 # $p is a jq variable, not a shell variable
+          CHILD_QUERY='.types[] | select(.children) | .name as $p | .children.types[] | "\(.name)\t\($p)"'
+          jq -r "$CHILD_QUERY" "$OLD_FILE" | sort -u > /tmp/old-children.txt
+          jq -r "$CHILD_QUERY" "$NEW_FILE" | sort -u > /tmp/new-children.txt
+          comm -23 /tmp/new-children.txt /tmp/old-children.txt > /tmp/added-children.txt
+
+          # Build PR title — prefer top-level types, fall back to child-only, then to bump message
+          PREFIX="feat(metadata): support "
+          MAX_LEN=72
+          ADDED_TOP_COUNT=$(wc -l < /tmp/added-types.txt | tr -d ' ')
+          ADDED_CHILD_COUNT=$(wc -l < /tmp/added-children.txt | tr -d ' ')
+
+          if [ "$ADDED_TOP_COUNT" -gt 0 ]; then
+            cp /tmp/added-types.txt /tmp/title-source.txt
+            TITLE_COUNT="$ADDED_TOP_COUNT"
+          elif [ "$ADDED_CHILD_COUNT" -gt 0 ]; then
+            # Use child name only for title; body retains full child (under Parent) context
+            cut -f1 /tmp/added-children.txt > /tmp/title-source.txt
+            TITLE_COUNT="$ADDED_CHILD_COUNT"
+          else
+            TITLE_COUNT=0
+          fi
+
+          if [ "$TITLE_COUNT" -eq 0 ]; then
+            TITLE="feat(metadata): refresh SDR registry to ${NEW_VERSION}"
+          else
+            JOINED=$(paste -sd "," /tmp/title-source.txt | sed 's/,/, /g')
+            CANDIDATE="${PREFIX}${JOINED}"
+            if [ "${#CANDIDATE}" -le "$MAX_LEN" ]; then
+              TITLE="$CANDIDATE"
+            else
+              TITLE="${PREFIX}${TITLE_COUNT} new metadata types"
+            fi
+          fi
+
+          # Build PR body — bump line + two sections
+          {
+            echo "Bumps @salesforce/source-deploy-retrieve from ${OLD_VERSION} to ${NEW_VERSION}."
+            echo ""
+            if [ -s /tmp/added-types.txt ]; then
+              echo "### New types"
+              echo ""
+              sed 's/^/- /' /tmp/added-types.txt
+              echo ""
+            fi
+            if [ -s /tmp/added-children.txt ]; then
+              echo "### New child types"
+              echo ""
+              awk -F'\t' '{print "- " $1 " (under " $2 ")"}' /tmp/added-children.txt
+              echo ""
+            fi
+          } > /tmp/pr-body.md
+
+          echo "$TITLE" > /tmp/pr-title.txt
+          echo "Resolved title: $TITLE"
+
+          rm -rf /tmp/sdr-old "/tmp/${TARBALL}"
+
+      - name: Close PR if not a registry change
+        if: steps.registry-check.outputs.registry_changed == 'false'
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          OLD_VERSION: ${{ steps.metadata.outputs.previous-version }}
+          NEW_VERSION: ${{ steps.metadata.outputs.new-version }}
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PAT }}
+        run: |
+          gh pr close "$PR_URL" --comment "Closing: @salesforce/source-deploy-retrieve update from ${OLD_VERSION} to ${NEW_VERSION} does not include metadata registry changes."
+
+      - name: Sync internal registry with SDR
+        if: steps.registry-check.outputs.registry_changed == 'true'
+        run: |
+          npm run sync:registry
+          npm run build
+          npm run lint:fix
+
+      - name: Commit and push if changed
+        id: push
+        if: steps.registry-check.outputs.registry_changed == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add src/metadata/internalRegistry.ts
+          git diff --staged --quiet || git commit -m "feat(metadata): sync internal registry with SDR update"
+          git push
+          echo "head_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Retitle and approve
+        if: steps.registry-check.outputs.registry_changed == 'true'
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PAT }}
+        run: |
+          TITLE=$(cat /tmp/pr-title.txt)
+          # The merge job squashes with this title and body.
+          gh pr edit "$PR_URL" --title "$TITLE" --body-file /tmp/pr-body.md
+          # Approve via REST endpoint — `gh pr review` resolves the reviewer
+          # identity through GraphQL fields (login/name/slug) that require
+          # `read:org` scope, which GITHUB_TOKEN cannot be granted.
+          gh api \
+            --method POST \
+            -H "Accept: application/vnd.github+json" \
+            "/repos/${REPO}/pulls/${PR_NUMBER}/reviews" \
+            -f event=APPROVE
+
+  # 2. Build the pushed commit with the pull-request build: quality plus every
+  # platform leg, e2e byte-equality included. Auto-merge alone would wait for
+  # the ruleset's only required check, build / quality, and merge with the
+  # platform legs red (#1530).
+  build:
+    needs: dependabot
+    if: needs.dependabot.outputs.registry_changed == 'true'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/reusable-build.yml
+    with:
+      ref: ${{ needs.dependabot.outputs.head_sha }}
+    secrets: inherit
+
+  # 3. Merge only that green commit. Re-running a failed build leg re-runs
+  # this job too.
+  merge:
+    needs: [dependabot, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Squash-merge
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          HEAD_SHA: ${{ needs.dependabot.outputs.head_sha }}
+          GITHUB_TOKEN: ${{ secrets.RELEASE_PAT }}
+        run: |
+          TITLE=$(gh pr view "$PR_URL" --json title --jq .title)
+          gh pr view "$PR_URL" --json body --jq .body > /tmp/pr-body.md
+          gh pr merge "$PR_URL" --auto --squash --match-head-commit "$HEAD_SHA" \
+            --subject "$TITLE" --body-file /tmp/pr-body.md

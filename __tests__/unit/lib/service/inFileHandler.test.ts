@@ -1,22 +1,51 @@
 'use strict'
-import { describe, expect, it, jest } from '@jest/globals'
+import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { MetadataRepository } from '../../../../src/metadata/MetadataRepository'
+import { getDefinition } from '../../../../src/metadata/metadataManager'
 import InFileHandler from '../../../../src/service/inFileHandler'
-import type { Work } from '../../../../src/types/work'
-import { writeFile } from '../../../../src/utils/fsHelper'
-import { getGlobalMetadata, getWork } from '../../../__utils__/globalTestHelper'
+import type { Config } from '../../../../src/types/config'
+import {
+  ChangeKind,
+  CopyOperationKind,
+  ManifestTarget,
+} from '../../../../src/types/handlerResult'
+import type { UnionOutcomes } from '../../../../src/types/runContext'
+import { elementsOf } from '../../../__utils__/handlerResultView'
+import { createElement } from '../../../__utils__/testElement'
+import { getConfig, getContext } from '../../../__utils__/testWork'
 
-const mockCompare = jest.fn()
-const mockPrune = jest.fn()
-jest.mock('../../../../src/utils/metadataDiff', () => {
+const { mockGetMessage, mockRun, mockWriter, mockKeep, mockBuildIgnoreHelper } =
+  vi.hoisted(() => ({
+    mockGetMessage: vi.fn(
+      (_key: string, tokens?: string[]) =>
+        `could not process '${tokens?.[0]}', please ensure it is properly formatted xml in both '${tokens?.[1]}' and '${tokens?.[2]}' revision`
+    ),
+    mockRun: vi.fn(),
+    mockWriter: vi.fn(),
+    mockKeep: vi.fn(),
+    mockBuildIgnoreHelper: vi.fn(),
+  }))
+
+vi.mock('../../../../src/utils/ignoreHelper', () => ({
+  buildIgnoreHelper: mockBuildIgnoreHelper,
+}))
+
+vi.mock('../../../../src/utils/MessageService', () => {
   return {
-    default: jest.fn().mockImplementation(() => {
-      return { compare: mockCompare, prune: mockPrune }
+    MessageService: vi.fn().mockImplementation(function () {
+      return { getMessage: mockGetMessage }
     }),
   }
 })
-jest.mock('../../../../src/utils/fsHelper')
+
+vi.mock('../../../../src/utils/metadataDiff', () => {
+  return {
+    default: vi.fn().mockImplementation(function () {
+      return { run: mockRun }
+    }),
+  }
+})
 
 const workflowType = {
   childXmlNames: [
@@ -46,125 +75,288 @@ const globalValueSetTranslationsType = {
 
 let globalMetadata: MetadataRepository
 beforeAll(async () => {
-  globalMetadata = await getGlobalMetadata()
+  globalMetadata = await getDefinition({})
 })
-let work: Work
+let config: Config
 beforeEach(() => {
-  jest.clearAllMocks()
-  work = getWork()
-
-  mockPrune.mockReturnValue({ xmlContent: '<xmlContent>', isEmpty: false })
+  vi.clearAllMocks()
+  config = getConfig()
+  mockKeep.mockReturnValue(true)
+  mockBuildIgnoreHelper.mockResolvedValue({ keep: mockKeep })
 })
-describe.each([true, false])(`inFileHandler -d: %s`, generateDelta => {
-  beforeEach(() => {
-    work.config.generateDelta = generateDelta
+
+describe('inFileHandler element comparison', () => {
+  it('Given an in-file container, When asked whether it compares elements, Then it answers true', () => {
+    // Arrange
+    const { changeType, element } = createElement(
+      'force-app/main/default/workflows/Account.workflow-meta.xml',
+      workflowType,
+      globalMetadata
+    )
+    const sut = new InFileHandler(changeType, element, getContext({ config }))
+
+    // Act
+    const result = sut.comparesElements()
+
+    // Assert
+    expect(result).toBe(true)
   })
+})
+
+describe('inFileHandler union outcomes', () => {
+  const path = 'force-app/main/default/workflows/Account.workflow-meta.xml'
+  const buildSut = (unions: UnionOutcomes) => {
+    const { changeType, element } = createElement(
+      path,
+      workflowType,
+      globalMetadata
+    )
+    return new InFileHandler(
+      changeType,
+      element,
+      getContext({ config, unions })
+    )
+  }
+
+  describe('Given a union outcome for the element path', () => {
+    it('When collect runs, Then elements and copies come from that outcome and run() is not called', async () => {
+      // Arrange
+      const sut = buildSut(
+        new Map([
+          [
+            path,
+            {
+              manifests: {
+                added: [{ type: 'WorkflowAlert', member: 'fromUnion' }],
+                modified: [],
+                deleted: [{ type: 'WorkflowTask', member: 'goneInUnion' }],
+              },
+              hasPackageContent: true,
+              writer: mockWriter,
+            },
+          ],
+        ])
+      )
+      mockRun.mockResolvedValue({
+        manifests: {
+          added: [{ type: 'WorkflowFlowAction', member: 'fromRun' }],
+          modified: [],
+          deleted: [],
+        },
+        hasPackageContent: true,
+        writer: mockWriter,
+      })
+
+      // Act
+      const result = await sut.collectAddition()
+
+      // Assert
+      expect(mockRun).not.toHaveBeenCalled()
+      expect(elementsOf(result)).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            target: ManifestTarget.Package,
+            type: 'WorkflowAlert',
+            member: 'Account.fromUnion',
+          }),
+          expect.objectContaining({
+            target: ManifestTarget.DestructiveChanges,
+            type: 'WorkflowTask',
+            member: 'Account.goneInUnion',
+          }),
+        ])
+      )
+      expect(elementsOf(result).some(m => m.member === 'Account.fromRun')).toBe(
+        false
+      )
+      expect(
+        result.copies.some(c => c.kind === CopyOperationKind.StreamedContent)
+      ).toBe(true)
+    })
+  })
+
+  describe('Given union outcomes that do not hold the element path', () => {
+    it('When collect runs, Then run() is used', async () => {
+      // Arrange
+      const sut = buildSut(new Map())
+      mockRun.mockResolvedValue({
+        manifests: {
+          added: [{ type: 'WorkflowFlowAction', member: 'fromRun' }],
+          modified: [],
+          deleted: [],
+        },
+        hasPackageContent: true,
+        writer: mockWriter,
+      })
+
+      // Act
+      const result = await sut.collectAddition()
+
+      // Assert
+      expect(mockRun).toHaveBeenCalledWith(path)
+      expect(elementsOf(result)).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ member: 'Account.fromRun' }),
+        ])
+      )
+    })
+  })
+})
+
+describe('inFileHandler', () => {
   describe('when file is added', () => {
     let sut: InFileHandler
     beforeEach(() => {
       // Arrange
-      sut = new InFileHandler(
-        'force-app/main/default/workflows/Test/Account.workflow-meta.xml',
+      const { changeType, element } = createElement(
+        'force-app/main/default/workflows/Account.workflow-meta.xml',
         workflowType,
-        work,
         globalMetadata
       )
-      mockCompare.mockImplementation(() =>
+      sut = new InFileHandler(changeType, element, getContext({ config }))
+      mockRun.mockImplementation(() =>
         Promise.resolve({
-          added: new Map([['WorkflowFlowAction', new Set(['test'])]]),
-          deleted: new Map(),
+          manifests: {
+            added: [{ type: 'WorkflowFlowAction', member: 'test' }],
+            modified: [],
+            deleted: [],
+          },
+          hasPackageContent: true,
+          writer: mockWriter,
         })
       )
     })
     it('should store the added metadata in the package', async () => {
       // Act
-      await sut.handleAddition()
+      const result = await sut.collectAddition()
 
       // Assert
-      expect(work.diffs.destructiveChanges.size).toEqual(0)
-      expect(work.diffs.package.get('Workflow')).toEqual(new Set(['Account']))
-      expect(work.diffs.package.get('WorkflowFlowAction')).toEqual(
-        new Set(['Account.test'])
+      expect(elementsOf(result)).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            target: ManifestTarget.Package,
+            type: 'Workflow',
+            member: 'Account',
+          }),
+          expect.objectContaining({
+            target: ManifestTarget.Package,
+            type: 'WorkflowFlowAction',
+            member: 'Account.test',
+          }),
+        ])
       )
-
-      expect(mockPrune).toHaveBeenCalled()
-      if (generateDelta) {
-        expect(writeFile).toHaveBeenCalled()
-      } else {
-        expect(writeFile).not.toHaveBeenCalled()
-      }
+      expect(
+        elementsOf(result).some(
+          m => m.target === ManifestTarget.DestructiveChanges
+        )
+      ).toBe(false)
+      expect(
+        result.copies.some(c => c.kind === CopyOperationKind.StreamedContent)
+      ).toBe(true)
     })
 
     describe('when metadata in file is not packable', () => {
       describe('when file have comparable metadata', () => {
         beforeEach(() => {
           // Arrange
-          sut = new InFileHandler(
+          const { changeType, element } = createElement(
             'force-app/main/default/globalValueSetTranslations/Numbers-fr.globalValueSetTranslation-meta.xml',
             globalValueSetTranslationsType,
-            work,
             globalMetadata
           )
-          mockCompare.mockImplementation(() =>
+          sut = new InFileHandler(changeType, element, getContext({ config }))
+          mockRun.mockImplementation(() =>
             Promise.resolve({
-              added: new Map([['ValueTranslation', new Set(['Three'])]]),
-              deleted: new Map(),
+              manifests: {
+                added: [{ type: 'ValueTranslation', member: 'Three' }],
+                modified: [],
+                deleted: [],
+              },
+              hasPackageContent: true,
+              writer: mockWriter,
             })
           )
         })
         it('should only store file name and not the metadata in file', async () => {
           // Act
-          await sut.handleAddition()
+          const result = await sut.collectAddition()
 
           // Assert
-          expect(work.diffs.destructiveChanges.size).toEqual(0)
-          expect(work.diffs.package.get('GlobalValueSetTranslation')).toEqual(
-            new Set(['Numbers-fr'])
+          expect(
+            elementsOf(result).some(
+              m => m.target === ManifestTarget.DestructiveChanges
+            )
+          ).toBe(false)
+          expect(elementsOf(result)).toEqual(
+            expect.arrayContaining([
+              expect.objectContaining({
+                target: ManifestTarget.Package,
+                type: 'GlobalValueSetTranslation',
+                member: 'Numbers-fr',
+              }),
+            ])
           )
-          expect(work.diffs.package.size).toEqual(1)
-
-          expect(mockPrune).toHaveBeenCalled()
-          if (generateDelta) {
-            expect(writeFile).toHaveBeenCalled()
-          } else {
-            expect(writeFile).not.toHaveBeenCalled()
-          }
+          const packageManifests = elementsOf(result).filter(
+            m => m.target === ManifestTarget.Package
+          )
+          expect(packageManifests).toHaveLength(1)
+          expect(
+            result.copies.some(
+              c => c.kind === CopyOperationKind.StreamedContent
+            )
+          ).toBe(true)
         })
       })
 
       describe('when file does not have comparable metadata but is not empty', () => {
         beforeEach(() => {
           // Arrange
-          sut = new InFileHandler(
+          const { changeType, element } = createElement(
             'force-app/main/default/globalValueSetTranslations/Numbers-fr.globalValueSetTranslation-meta.xml',
             globalValueSetTranslationsType,
-            work,
             globalMetadata
           )
-          mockCompare.mockImplementation(() =>
+          sut = new InFileHandler(changeType, element, getContext({ config }))
+          mockRun.mockImplementation(() =>
             Promise.resolve({
-              added: new Map(),
-              deleted: new Map(),
+              manifests: {
+                added: [],
+                modified: [],
+                deleted: [],
+              },
+              hasPackageContent: true,
+              writer: mockWriter,
             })
           )
         })
         it('should only store file name and not the metadata in file', async () => {
           // Act
-          await sut.handleAddition()
+          const result = await sut.collectAddition()
 
           // Assert
-          expect(work.diffs.destructiveChanges.size).toEqual(0)
-          expect(work.diffs.package.get('GlobalValueSetTranslation')).toEqual(
-            new Set(['Numbers-fr'])
+          expect(
+            elementsOf(result).some(
+              m => m.target === ManifestTarget.DestructiveChanges
+            )
+          ).toBe(false)
+          expect(elementsOf(result)).toEqual(
+            expect.arrayContaining([
+              expect.objectContaining({
+                target: ManifestTarget.Package,
+                type: 'GlobalValueSetTranslation',
+                member: 'Numbers-fr',
+              }),
+            ])
           )
-          expect(work.diffs.package.size).toEqual(1)
-
-          expect(mockPrune).toHaveBeenCalled()
-          if (generateDelta) {
-            expect(writeFile).toHaveBeenCalled()
-          } else {
-            expect(writeFile).not.toHaveBeenCalled()
-          }
+          const packageManifests = elementsOf(result).filter(
+            m => m.target === ManifestTarget.Package
+          )
+          expect(packageManifests).toHaveLength(1)
+          expect(
+            result.copies.some(
+              c => c.kind === CopyOperationKind.StreamedContent
+            )
+          ).toBe(true)
         })
       })
     })
@@ -173,148 +365,247 @@ describe.each([true, false])(`inFileHandler -d: %s`, generateDelta => {
   describe('when file is modified', () => {
     let sut: InFileHandler
 
-    describe('when element are added and deleted', () => {
+    describe('when elements are added and deleted', () => {
       beforeEach(() => {
         // Arrange
-        sut = new InFileHandler(
-          'force-app/main/default/workflows/Test/Account.workflow-meta.xml',
+        const { changeType, element } = createElement(
+          'force-app/main/default/workflows/Account.workflow-meta.xml',
           workflowType,
-          work,
           globalMetadata
         )
-        mockCompare.mockImplementation(() =>
+        sut = new InFileHandler(changeType, element, getContext({ config }))
+        mockRun.mockImplementation(() =>
           Promise.resolve({
-            added: new Map([['WorkflowAlert', new Set(['test'])]]),
-            deleted: new Map([['WorkflowAlert', new Set(['deleted'])]]),
+            manifests: {
+              added: [{ type: 'WorkflowAlert', member: 'test' }],
+              modified: [],
+              deleted: [{ type: 'WorkflowAlert', member: 'deleted' }],
+            },
+            hasPackageContent: true,
+            writer: mockWriter,
           })
         )
       })
       it('should store the added metadata in the package and deleted in the destructiveChanges', async () => {
         // Act
-        await sut.handleModification()
+        const result = await sut.collectModification()
 
         // Assert
-        expect(work.diffs.package.get('Workflow')).toEqual(new Set(['Account']))
-        expect(work.diffs.package.get('WorkflowAlert')).toEqual(
-          new Set(['Account.test'])
+        expect(elementsOf(result)).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              target: ManifestTarget.Package,
+              type: 'Workflow',
+              member: 'Account',
+            }),
+            expect.objectContaining({
+              target: ManifestTarget.Package,
+              type: 'WorkflowAlert',
+              member: 'Account.test',
+            }),
+            expect.objectContaining({
+              target: ManifestTarget.DestructiveChanges,
+              type: 'WorkflowAlert',
+              member: 'Account.deleted',
+            }),
+          ])
         )
-        expect(work.diffs.destructiveChanges.get('WorkflowAlert')).toEqual(
-          new Set(['Account.deleted'])
-        )
-        expect(work.diffs.destructiveChanges.has('Workflow')).toBe(false)
-        expect(mockPrune).toHaveBeenCalled()
-        if (generateDelta) {
-          expect(writeFile).toHaveBeenCalled()
-        } else {
-          expect(writeFile).not.toHaveBeenCalled()
-        }
+        expect(
+          elementsOf(result).some(
+            m =>
+              m.target === ManifestTarget.DestructiveChanges &&
+              m.type === 'Workflow'
+          )
+        ).toBe(false)
+        expect(
+          result.copies.some(c => c.kind === CopyOperationKind.StreamedContent)
+        ).toBe(true)
       })
     })
 
-    describe('when element are deleted and nothing is added', () => {
+    describe('Given the file path is ignored by the destructive ignore', () => {
+      const workflowPath =
+        'force-app/main/default/workflows/Account.workflow-meta.xml'
       beforeEach(() => {
         // Arrange
-        sut = new InFileHandler(
-          'force-app/main/default/workflows/Test/Account.workflow-meta.xml',
+        const { changeType, element } = createElement(
+          `M\t${workflowPath}`,
           workflowType,
-          work,
           globalMetadata
         )
-        mockCompare.mockImplementation(() =>
+        sut = new InFileHandler(changeType, element, getContext({ config }))
+        mockKeep.mockImplementation(
+          (line: string) => line !== `D\t${workflowPath}`
+        )
+        mockRun.mockImplementation(() =>
           Promise.resolve({
-            added: new Map(),
-            deleted: new Map([['WorkflowAlert', new Set(['deleted'])]]),
+            manifests: {
+              added: [{ type: 'WorkflowAlert', member: 'added' }],
+              modified: [],
+              deleted: [{ type: 'WorkflowAlert', member: 'deleted' }],
+            },
+            hasPackageContent: true,
+            writer: mockWriter,
           })
         )
-        mockPrune.mockReturnValue({
-          xmlContent: '<xmlContent>',
-          isEmpty: true,
-        })
       })
-      it('should store the deleted in the destructiveChanges and not copy the file', async () => {
+
+      it('When collecting the modification, Then no element targets destructiveChanges', async () => {
         // Act
-        await sut.handleModification()
+        const result = await sut.collectModification()
 
         // Assert
-        expect(work.diffs.package.size).toBe(0)
-        expect(work.diffs.destructiveChanges.get('WorkflowAlert')).toEqual(
-          new Set(['Account.deleted'])
+        expect(
+          elementsOf(result).filter(
+            m => m.target === ManifestTarget.DestructiveChanges
+          )
+        ).toEqual([])
+      })
+
+      it('When collecting the modification, Then the added elements still target the package', async () => {
+        // Act
+        const result = await sut.collectModification()
+
+        // Assert
+        expect(elementsOf(result)).toEqual([
+          expect.objectContaining({
+            target: ManifestTarget.Package,
+            type: 'WorkflowAlert',
+            member: 'Account.added',
+          }),
+          expect.objectContaining({
+            target: ManifestTarget.Package,
+            type: 'Workflow',
+            member: 'Account',
+          }),
+        ])
+      })
+    })
+
+    describe('when elements are deleted and nothing is added', () => {
+      beforeEach(() => {
+        // Arrange
+        const { changeType, element } = createElement(
+          'force-app/main/default/workflows/Account.workflow-meta.xml',
+          workflowType,
+          globalMetadata
         )
-        expect(work.diffs.destructiveChanges.has('Workflow')).toBe(false)
-        expect(mockPrune).toHaveBeenCalled()
-        expect(writeFile).not.toHaveBeenCalled()
+        sut = new InFileHandler(changeType, element, getContext({ config }))
+        mockRun.mockImplementation(() =>
+          Promise.resolve({
+            manifests: {
+              added: [],
+              modified: [],
+              deleted: [{ type: 'WorkflowAlert', member: 'deleted' }],
+            },
+            hasPackageContent: false,
+          })
+        )
+      })
+      it('should store the deleted in the destructiveChanges and not produce a copy', async () => {
+        // Act
+        const result = await sut.collectModification()
+
+        // Assert
+        const packageManifests = elementsOf(result).filter(
+          m => m.target === ManifestTarget.Package
+        )
+        expect(packageManifests).toHaveLength(0)
+        expect(elementsOf(result)).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              target: ManifestTarget.DestructiveChanges,
+              type: 'WorkflowAlert',
+              member: 'Account.deleted',
+            }),
+          ])
+        )
+        expect(
+          elementsOf(result).some(
+            m =>
+              m.target === ManifestTarget.DestructiveChanges &&
+              m.type === 'Workflow'
+          )
+        ).toBe(false)
+        expect(
+          result.copies.some(c => c.kind === CopyOperationKind.StreamedContent)
+        ).toBe(false)
       })
 
-      describe('when no metadata element are added/deleted and the file does not contains attributes', () => {
+      describe('when no metadata elements are added/deleted and the file does not contain attributes', () => {
         beforeEach(() => {
           // Arrange
-          sut = new InFileHandler(
-            'force-app/main/default/workflows/Test/Account.workflow-meta.xml',
+          const { changeType, element } = createElement(
+            'force-app/main/default/workflows/Account.workflow-meta.xml',
             workflowType,
-            work,
             globalMetadata
           )
+          sut = new InFileHandler(changeType, element, getContext({ config }))
 
-          mockCompare.mockImplementation(() =>
+          mockRun.mockImplementation(() =>
             Promise.resolve({
-              added: new Map(),
-              deleted: new Map(),
+              manifests: {
+                added: [],
+                modified: [],
+                deleted: [],
+              },
+              hasPackageContent: false,
             })
           )
-
-          mockPrune.mockReturnValue({
-            xmlContent: '<xmlContent>',
-            isEmpty: true,
-          })
         })
-        it('nothing should be stored and the file should not be copied', async () => {
+        it('nothing should be stored and no copy should be produced', async () => {
           // Act
-          await sut.handleModification()
+          const result = await sut.collectModification()
 
           // Assert
-          expect(work.diffs.package.size).toEqual(0)
-          expect(work.diffs.destructiveChanges.size).toEqual(0)
-          expect(mockPrune).toHaveBeenCalled()
-          if (generateDelta) {
-            expect(writeFile).not.toHaveBeenCalled()
-          } else {
-            expect(writeFile).not.toHaveBeenCalled()
-          }
+          expect(elementsOf(result)).toHaveLength(0)
+          expect(result.copies).toHaveLength(0)
         })
       })
 
-      describe('when no metadata element are added, some are deleted but the file contains attributes', () => {
+      describe('when no metadata elements are added, some are deleted but the file contains attributes', () => {
         beforeEach(() => {
           // Arrange
-          sut = new InFileHandler(
-            'force-app/main/default/workflows/Test/Account.workflow-meta.xml',
+          const { changeType, element } = createElement(
+            'force-app/main/default/workflows/Account.workflow-meta.xml',
             workflowType,
-            work,
             globalMetadata
           )
-          mockCompare.mockImplementation(() =>
+          sut = new InFileHandler(changeType, element, getContext({ config }))
+          mockRun.mockImplementation(() =>
             Promise.resolve({
-              added: new Map(),
-              deleted: new Map([['Workflow', new Set(['Deleted'])]]),
+              manifests: {
+                added: [],
+                modified: [],
+                deleted: [{ type: 'Workflow', member: 'Deleted' }],
+              },
+              hasPackageContent: false,
             })
           )
-          mockPrune.mockReturnValue({
-            xmlContent: '<xmlContent>',
-            isEmpty: true,
-          })
         })
-        it('should store the added metadata in the package and the file should be copied', async () => {
+        it('should store the deleted metadata in destructiveChanges and not produce a copy', async () => {
           // Act
-          await sut.handleModification()
+          const result = await sut.collectModification()
 
           // Assert
-          expect(work.diffs.package.size).toEqual(0)
-          expect(work.diffs.destructiveChanges.size).toEqual(1)
-          expect(work.diffs.destructiveChanges.get('Workflow')).toEqual(
-            new Set(['Account.Deleted'])
+          const packageManifests = elementsOf(result).filter(
+            m => m.target === ManifestTarget.Package
           )
-          expect(mockPrune).toHaveBeenCalled()
-          expect(writeFile).not.toHaveBeenCalled()
+          expect(packageManifests).toHaveLength(0)
+          expect(elementsOf(result)).toEqual(
+            expect.arrayContaining([
+              expect.objectContaining({
+                target: ManifestTarget.DestructiveChanges,
+                type: 'Workflow',
+                member: 'Account.Deleted',
+              }),
+            ])
+          )
+          expect(
+            result.copies.some(
+              c => c.kind === CopyOperationKind.StreamedContent
+            )
+          ).toBe(false)
         })
       })
     })
@@ -323,78 +614,149 @@ describe.each([true, false])(`inFileHandler -d: %s`, generateDelta => {
       describe('when file have comparable metadata', () => {
         beforeEach(() => {
           // Arrange
-          sut = new InFileHandler(
+          const { changeType, element } = createElement(
             'force-app/main/default/globalValueSetTranslations/Numbers-fr.globalValueSetTranslation-meta.xml',
             globalValueSetTranslationsType,
-            work,
             globalMetadata
           )
-          mockCompare.mockImplementation(() =>
+          sut = new InFileHandler(changeType, element, getContext({ config }))
+          mockRun.mockImplementation(() =>
             Promise.resolve({
-              added: new Map([['ValueTranslation', new Set(['Three'])]]),
-              deleted: new Map(),
+              manifests: {
+                added: [{ type: 'ValueTranslation', member: 'Three' }],
+                modified: [],
+                deleted: [],
+              },
+              hasPackageContent: true,
+              writer: mockWriter,
             })
           )
-          mockPrune.mockReturnValue({
-            xmlContent: '<xmlContent>',
-            isEmpty: false,
-          })
         })
         it('should only store file name and not the metadata in file', async () => {
           // Act
-          await sut.handleModification()
+          const result = await sut.collectModification()
 
           // Assert
-          expect(work.diffs.destructiveChanges.size).toEqual(0)
-          expect(work.diffs.package.get('GlobalValueSetTranslation')).toEqual(
-            new Set(['Numbers-fr'])
+          expect(
+            elementsOf(result).some(
+              m => m.target === ManifestTarget.DestructiveChanges
+            )
+          ).toBe(false)
+          expect(elementsOf(result)).toEqual(
+            expect.arrayContaining([
+              expect.objectContaining({
+                target: ManifestTarget.Package,
+                type: 'GlobalValueSetTranslation',
+                member: 'Numbers-fr',
+              }),
+            ])
           )
-          expect(work.diffs.package.size).toEqual(1)
-
-          expect(mockPrune).toHaveBeenCalled()
-          if (generateDelta) {
-            expect(writeFile).toHaveBeenCalled()
-          } else {
-            expect(writeFile).not.toHaveBeenCalled()
-          }
+          const packageManifests = elementsOf(result).filter(
+            m => m.target === ManifestTarget.Package
+          )
+          expect(packageManifests).toHaveLength(1)
+          expect(
+            result.copies.some(
+              c => c.kind === CopyOperationKind.StreamedContent
+            )
+          ).toBe(true)
         })
       })
 
       describe('when file does not have comparable metadata but is not empty', () => {
         beforeEach(() => {
           // Arrange
-          sut = new InFileHandler(
+          const { changeType, element } = createElement(
             'force-app/main/default/globalValueSetTranslations/Numbers-fr.globalValueSetTranslation-meta.xml',
             globalValueSetTranslationsType,
-            work,
             globalMetadata
           )
-          mockCompare.mockImplementation(() =>
+          sut = new InFileHandler(changeType, element, getContext({ config }))
+          mockRun.mockImplementation(() =>
             Promise.resolve({
-              added: new Map(),
-              deleted: new Map(),
+              manifests: {
+                added: [],
+                modified: [],
+                deleted: [],
+              },
+              hasPackageContent: true,
+              writer: mockWriter,
             })
           )
         })
         it('should only store file name and not the metadata in file', async () => {
           // Act
-          await sut.handleModification()
+          const result = await sut.collectModification()
 
           // Assert
-          expect(work.diffs.destructiveChanges.size).toEqual(0)
-          expect(work.diffs.package.get('GlobalValueSetTranslation')).toEqual(
-            new Set(['Numbers-fr'])
+          expect(
+            elementsOf(result).some(
+              m => m.target === ManifestTarget.DestructiveChanges
+            )
+          ).toBe(false)
+          expect(elementsOf(result)).toEqual(
+            expect.arrayContaining([
+              expect.objectContaining({
+                target: ManifestTarget.Package,
+                type: 'GlobalValueSetTranslation',
+                member: 'Numbers-fr',
+              }),
+            ])
           )
-          expect(work.diffs.package.size).toEqual(1)
-
-          expect(mockPrune).toHaveBeenCalled()
-          if (generateDelta) {
-            expect(writeFile).toHaveBeenCalled()
-          } else {
-            expect(writeFile).not.toHaveBeenCalled()
-          }
+          const packageManifests = elementsOf(result).filter(
+            m => m.target === ManifestTarget.Package
+          )
+          expect(packageManifests).toHaveLength(1)
+          expect(
+            result.copies.some(
+              c => c.kind === CopyOperationKind.StreamedContent
+            )
+          ).toBe(true)
         })
       })
+    })
+  })
+
+  describe('Given a deletion line whose path the destructive ignore covers', () => {
+    const workflowPath =
+      'force-app/main/default/workflows/Account.workflow-meta.xml'
+    let sut: InFileHandler
+    beforeEach(() => {
+      // Arrange
+      const { changeType, element } = createElement(
+        `D\t${workflowPath}`,
+        workflowType,
+        globalMetadata
+      )
+      sut = new InFileHandler(changeType, element, getContext({ config }))
+      mockKeep.mockReturnValue(false)
+      mockRun.mockImplementation(() =>
+        Promise.resolve({
+          manifests: {
+            added: [],
+            modified: [],
+            deleted: [{ type: 'WorkflowAlert', member: 'deleted' }],
+          },
+          hasPackageContent: false,
+        })
+      )
+    })
+
+    // Upstream line filtering already applied the destructive ignore to a
+    // main-diff deletion, so a deletion reaching the handler comes from an
+    // explicit include that must win over the ignore.
+    it('When collecting the deletion, Then the deleted metadata still targets destructiveChanges', async () => {
+      // Act
+      const result = await sut.collectDeletion()
+
+      // Assert
+      expect(elementsOf(result)).toEqual([
+        expect.objectContaining({
+          target: ManifestTarget.DestructiveChanges,
+          type: 'WorkflowAlert',
+          member: 'Account.deleted',
+        }),
+      ])
     })
   })
 
@@ -402,60 +764,426 @@ describe.each([true, false])(`inFileHandler -d: %s`, generateDelta => {
     let sut: InFileHandler
     beforeEach(() => {
       // Arrange
-      sut = new InFileHandler(
-        'force-app/main/default/workflows/Test/Account.workflow-meta.xml',
+      const { changeType, element } = createElement(
+        'force-app/main/default/workflows/Account.workflow-meta.xml',
         workflowType,
-        work,
         globalMetadata
       )
-      mockCompare.mockImplementation(() =>
+      sut = new InFileHandler(changeType, element, getContext({ config }))
+      mockRun.mockImplementation(() =>
         Promise.resolve({
-          added: new Map(),
-          deleted: new Map([['WorkflowAlert', new Set(['test'])]]),
+          manifests: {
+            added: [],
+            modified: [],
+            deleted: [{ type: 'WorkflowAlert', member: 'test' }],
+          },
+          hasPackageContent: false,
         })
       )
-      mockPrune.mockReturnValue({ xmlContent: '<xmlContent>', isEmpty: true })
     })
     it('should store the deleted metadata in the destructiveChanges', async () => {
       // Act
-      await sut.handleDeletion()
+      const result = await sut.collectDeletion()
 
       // Assert
-      expect(work.diffs.package.size).toEqual(0)
-      expect(work.diffs.destructiveChanges.has('Workflow')).toBe(false)
-      expect(work.diffs.destructiveChanges.get('WorkflowAlert')).toEqual(
-        new Set(['Account.test'])
+      const packageManifests = elementsOf(result).filter(
+        m => m.target === ManifestTarget.Package
       )
-      expect(mockCompare).toHaveBeenCalled()
-      expect(mockPrune).toHaveBeenCalled()
-      expect(writeFile).not.toHaveBeenCalled()
+      expect(packageManifests).toHaveLength(0)
+      expect(elementsOf(result)).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            target: ManifestTarget.DestructiveChanges,
+            type: 'WorkflowAlert',
+            member: 'Account.test',
+          }),
+        ])
+      )
+      expect(
+        elementsOf(result).some(
+          m =>
+            m.target === ManifestTarget.DestructiveChanges &&
+            m.type === 'Workflow'
+        )
+      ).toBe(false)
+      expect(mockRun).toHaveBeenCalled()
+      expect(
+        result.copies.some(c => c.kind === CopyOperationKind.StreamedContent)
+      ).toBe(false)
     })
     describe('when metadata in file is prune Only', () => {
       beforeEach(() => {
         // Arrange
-        sut = new InFileHandler(
+        const { changeType, element } = createElement(
           'force-app/main/default/globalValueSetTranslations/Numbers-fr.globalValueSetTranslation-meta.xml',
           globalValueSetTranslationsType,
-          work,
           globalMetadata
         )
+        sut = new InFileHandler(changeType, element, getContext({ config }))
       })
       it('should only store file name and not the metadata in file', async () => {
         // Act
-        await sut.handleDeletion()
+        const result = await sut.collectDeletion()
 
         // Assert
-        expect(work.diffs.package.size).toEqual(0)
-        expect(work.diffs.destructiveChanges.has('ValueTranslation')).toBe(
-          false
+        const packageManifests = elementsOf(result).filter(
+          m => m.target === ManifestTarget.Package
+        )
+        expect(packageManifests).toHaveLength(0)
+        expect(elementsOf(result)).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              target: ManifestTarget.DestructiveChanges,
+              type: 'GlobalValueSetTranslation',
+              member: 'Numbers-fr',
+            }),
+          ])
         )
         expect(
-          work.diffs.destructiveChanges.get('GlobalValueSetTranslation')
-        ).toEqual(new Set(['Numbers-fr']))
-        expect(mockCompare).not.toHaveBeenCalled()
-        expect(mockPrune).not.toHaveBeenCalled()
-        expect(writeFile).not.toHaveBeenCalled()
+          elementsOf(result).some(m => m.type === 'ValueTranslation')
+        ).toBe(false)
+        expect(mockRun).not.toHaveBeenCalled()
+        expect(result.copies).toHaveLength(0)
       })
     })
+  })
+})
+
+describe('inFileHandler collect', () => {
+  let globalMetadata: MetadataRepository
+  beforeAll(async () => {
+    globalMetadata = await getDefinition({})
+  })
+
+  let config: Config
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    config = getConfig()
+  })
+
+  it('Given added workflow with child elements, When collect, Then returns Package manifests and ComputedContent copy', async () => {
+    // Arrange
+    const { changeType, element } = createElement(
+      'A       force-app/main/default/workflows/Account.workflow-meta.xml',
+      workflowType,
+      globalMetadata
+    )
+    const sut = new InFileHandler(changeType, element, getContext({ config }))
+    mockRun.mockImplementation(() =>
+      Promise.resolve({
+        manifests: {
+          added: [{ type: 'WorkflowFlowAction', member: 'test' }],
+          modified: [],
+          deleted: [],
+        },
+        hasPackageContent: true,
+        writer: mockWriter,
+      })
+    )
+
+    // Act
+    const result = await sut.collect()
+
+    // Assert
+    expect(elementsOf(result)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          target: ManifestTarget.Package,
+          type: 'Workflow',
+          member: 'Account',
+        }),
+        expect.objectContaining({
+          target: ManifestTarget.Package,
+          type: 'WorkflowFlowAction',
+          member: 'Account.test',
+        }),
+      ])
+    )
+    expect(
+      result.copies.some(c => c.kind === CopyOperationKind.StreamedContent)
+    ).toBe(true)
+    expect(result.warnings).toHaveLength(0)
+  })
+
+  it('Given added workflow with generateDelta false, When collect, Then returns manifests without copies', async () => {
+    // Arrange
+    config.generateDelta = false
+    const { changeType, element } = createElement(
+      'A       force-app/main/default/workflows/Account.workflow-meta.xml',
+      workflowType,
+      globalMetadata
+    )
+    const sut = new InFileHandler(changeType, element, getContext({ config }))
+    mockRun.mockImplementation(() =>
+      Promise.resolve({
+        manifests: {
+          added: [{ type: 'WorkflowFlowAction', member: 'test' }],
+          modified: [],
+          deleted: [],
+        },
+        hasPackageContent: true,
+        writer: mockWriter,
+      })
+    )
+
+    // Act
+    const result = await sut.collect()
+
+    // Assert
+    expect(elementsOf(result).length).toBeGreaterThan(0)
+    expect(result.copies).toHaveLength(0)
+    expect(result.warnings).toHaveLength(0)
+  })
+
+  it('Given compare throws an error, When collect, Then returns warning with meaningful message', async () => {
+    // Arrange
+    config.from = 'commitA'
+    config.to = 'commitB'
+    const { changeType, element } = createElement(
+      'A       force-app/main/default/workflows/Account.workflow-meta.xml',
+      workflowType,
+      globalMetadata
+    )
+    const sut = new InFileHandler(changeType, element, getContext({ config }))
+    mockRun.mockImplementation(() =>
+      Promise.reject(
+        new Error("Cannot read properties of undefined (reading 'addChild')")
+      )
+    )
+
+    // Act
+    const result = await sut.collect()
+
+    // Assert
+    expect(elementsOf(result)).toHaveLength(0)
+    expect(result.copies).toHaveLength(0)
+    expect(result.warnings).toHaveLength(1)
+    expect(mockGetMessage).toHaveBeenCalledWith('warning.MalformedXML', [
+      'force-app/main/default/workflows/Account.workflow-meta.xml',
+      'commitA',
+      'commitB',
+    ])
+    expect(result.warnings[0].message).toContain(
+      'force-app/main/default/workflows/Account.workflow-meta.xml'
+    )
+    expect(result.warnings[0].message).toContain('commitA')
+    expect(result.warnings[0].message).toContain('commitB')
+    expect(result.warnings[0].cause).toBeInstanceOf(Error)
+  })
+
+  it('Given added workflow, When collect, Then _delegateFileCopy returns false and no GitCopy operations are produced', async () => {
+    // Arrange
+    const { changeType, element } = createElement(
+      'A       force-app/main/default/workflows/Account.workflow-meta.xml',
+      workflowType,
+      globalMetadata
+    )
+    const sut = new InFileHandler(changeType, element, getContext({ config }))
+    mockRun.mockImplementation(() =>
+      Promise.resolve({
+        manifests: {
+          added: [{ type: 'WorkflowFlowAction', member: 'test' }],
+          modified: [],
+          deleted: [],
+        },
+        hasPackageContent: true,
+        writer: mockWriter,
+      })
+    )
+
+    // Act
+    const result = await sut.collect()
+
+    // Assert
+    expect(result.copies.every(c => c.kind !== CopyOperationKind.GitCopy)).toBe(
+      true
+    )
+    expect(
+      result.copies.some(c => c.kind === CopyOperationKind.StreamedContent)
+    ).toBe(true)
+  })
+
+  it('Given modified workflow with added and deleted elements, When collect, Then returns both Package and DestructiveChanges manifests', async () => {
+    // Arrange
+    const { changeType, element } = createElement(
+      'M       force-app/main/default/workflows/Account.workflow-meta.xml',
+      workflowType,
+      globalMetadata
+    )
+    const sut = new InFileHandler(changeType, element, getContext({ config }))
+    mockRun.mockImplementation(() =>
+      Promise.resolve({
+        manifests: {
+          added: [{ type: 'WorkflowAlert', member: 'added' }],
+          modified: [],
+          deleted: [{ type: 'WorkflowAlert', member: 'removed' }],
+        },
+        hasPackageContent: true,
+        writer: mockWriter,
+      })
+    )
+
+    // Act
+    const result = await sut.collect()
+
+    // Assert
+    expect(elementsOf(result)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          target: ManifestTarget.Package,
+          type: 'WorkflowAlert',
+          member: 'Account.added',
+        }),
+        expect.objectContaining({
+          target: ManifestTarget.DestructiveChanges,
+          type: 'WorkflowAlert',
+          member: 'Account.removed',
+        }),
+      ])
+    )
+    expect(result.warnings).toHaveLength(0)
+  })
+
+  it('Given generateDelta false, When collect with changes, Then no StreamedContent copy is emitted', async () => {
+    // Arrange
+    config.generateDelta = false
+    const { changeType, element } = createElement(
+      'A       force-app/main/default/workflows/Account.workflow-meta.xml',
+      workflowType,
+      globalMetadata
+    )
+    const sut = new InFileHandler(changeType, element, getContext({ config }))
+    mockRun.mockImplementation(() =>
+      Promise.resolve({
+        manifests: {
+          added: [{ type: 'WorkflowFlowAction', member: 'test' }],
+          modified: [],
+          deleted: [],
+        },
+        hasPackageContent: true,
+        writer: mockWriter,
+      })
+    )
+
+    // Act
+    const result = await sut.collect()
+
+    // Assert
+    expect(result.copies).toHaveLength(0)
+    expect(mockWriter).not.toHaveBeenCalled()
+  })
+
+  it('Given generateDelta true with a writer, When collect runs, Then prune is called and ComputedContent is produced', async () => {
+    // Arrange
+    config.generateDelta = true
+    const { changeType, element } = createElement(
+      'A       force-app/main/default/workflows/Account.workflow-meta.xml',
+      workflowType,
+      globalMetadata
+    )
+    const sut = new InFileHandler(changeType, element, getContext({ config }))
+    mockRun.mockImplementation(() =>
+      Promise.resolve({
+        manifests: {
+          added: [{ type: 'WorkflowFlowAction', member: 'test' }],
+          modified: [],
+          deleted: [],
+        },
+        hasPackageContent: true,
+        writer: mockWriter,
+      })
+    )
+
+    // Act
+    const result = await sut.collect()
+
+    // Assert
+    expect(
+      result.copies.some(c => c.kind === CopyOperationKind.StreamedContent)
+    ).toBe(true)
+  })
+
+  it('Given hasPackageContent=true with writer absent (generateDelta=false, packable child added), When collect runs, Then the parent container is added to package manifest', async () => {
+    // Regression lock: under generateDelta=false the engine produces
+    // hasPackageContent=true but no writer (no per-file pruned XML).
+    // The handler MUST still emit the parent container so the file is
+    // listed in package.xml — without it, Salesforce rejects the deploy
+    // for any pre-existing sibling sub-element of the same parent.
+    config.generateDelta = false
+    const { changeType, element } = createElement(
+      'A       force-app/main/default/workflows/Account.workflow-meta.xml',
+      workflowType,
+      globalMetadata
+    )
+    const sut = new InFileHandler(changeType, element, getContext({ config }))
+    mockRun.mockResolvedValue({
+      manifests: {
+        added: [{ type: 'WorkflowAlert', member: 'NewAlert' }],
+        modified: [],
+        deleted: [],
+      },
+      hasPackageContent: true,
+      // no writer — generateDelta=false produces no per-file pruned XML
+    })
+
+    // Act
+    const result = await sut.collect()
+
+    // Assert — parent Workflow container present in package manifest
+    expect(elementsOf(result)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          target: ManifestTarget.Package,
+          type: 'Workflow',
+          member: 'Account',
+        }),
+        expect.objectContaining({
+          target: ManifestTarget.Package,
+          type: 'WorkflowAlert',
+          member: 'Account.NewAlert',
+        }),
+      ])
+    )
+    expect(
+      result.copies.some(c => c.kind === CopyOperationKind.StreamedContent)
+    ).toBe(false)
+  })
+
+  it('Given metadataDiff reports modified child elements, When collect runs, Then modified entries are added to the package manifest', async () => {
+    // Regression lock: _collectCompareResult collects added, modified AND
+    // deleted comparison buckets separately. Every other fixture in this
+    // file leaves `modified` empty, so a removed modified-bucket collection
+    // call would go unnoticed without this test.
+    const { changeType, element } = createElement(
+      'A       force-app/main/default/workflows/Account.workflow-meta.xml',
+      workflowType,
+      globalMetadata
+    )
+    const sut = new InFileHandler(changeType, element, getContext({ config }))
+    mockRun.mockResolvedValue({
+      manifests: {
+        added: [],
+        modified: [{ type: 'WorkflowAlert', member: 'ChangedAlert' }],
+        deleted: [],
+      },
+      hasPackageContent: true,
+      writer: mockWriter,
+    })
+
+    // Act
+    const result = await sut.collect()
+
+    // Assert
+    expect(elementsOf(result)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          target: ManifestTarget.Package,
+          type: 'WorkflowAlert',
+          member: 'Account.ChangedAlert',
+          changeKind: ChangeKind.Modify,
+        }),
+      ])
+    )
   })
 })

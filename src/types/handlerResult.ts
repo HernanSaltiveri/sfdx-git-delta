@@ -1,0 +1,114 @@
+'use strict'
+import type { Writable } from 'node:stream'
+
+export enum ManifestTarget {
+  Package = 'package',
+  DestructiveChanges = 'destructiveChanges',
+}
+
+export enum ChangeKind {
+  Add = 'add',
+  Modify = 'modify',
+  Delete = 'delete',
+  Rename = 'rename',
+}
+
+// Handlers can only produce single-component change kinds — rename carries a
+// (from, to) pair that the flat ManifestElement shape can't represent, so it
+// is captured separately via ChangeSet.from's renames channel.
+export type AddKind = ChangeKind.Add | ChangeKind.Modify | ChangeKind.Delete
+
+export enum CopyOperationKind {
+  GitCopy = 'gitCopy',
+  GitDirCopy = 'gitDirCopy',
+  GitComponentCopy = 'gitComponentCopy',
+  GitTypeDirCompanionCopy = 'gitTypeDirCompanionCopy',
+  StreamedContent = 'streamedContent',
+  AugmentedContent = 'augmentedContent',
+}
+
+export type ManifestElement = {
+  target: ManifestTarget
+  type: string
+  member: string
+  changeKind: AddKind
+}
+
+export type GitCopyOperation = {
+  kind: CopyOperationKind.GitCopy
+  path: string
+  revision: string
+}
+
+export type GitDirCopyOperation = {
+  kind: CopyOperationKind.GitDirCopy
+  path: string
+  revision: string
+}
+
+// Every file at revision inside the component folder path or named as a dotted
+// sibling of it, resolved once per run however many lines asked for it.
+export type GitComponentCopyOperation = {
+  kind: CopyOperationKind.GitComponentCopy
+  path: string
+  revision: string
+}
+
+// Every file at revision directly in a bundle type directory, plus every file
+// under its subdirectories that are not bundles, resolved once per
+// (revision, directory) however many bundles asked.
+export type GitTypeDirCompanionCopyOperation = {
+  kind: CopyOperationKind.GitTypeDirCompanionCopy
+  // The type directory, e.g. force-app/main/default/lwc
+  path: string
+  revision: string
+}
+
+export type StreamedContentOperation = {
+  kind: CopyOperationKind.StreamedContent
+  path: string
+  writer: (out: Writable) => Promise<void>
+}
+
+// Rewrites a path after every other operation of the run has settled. Its
+// writer receives what an earlier operation of the same run wrote at that
+// path, or undefined when none did.
+export type AugmentedContentOperation = {
+  kind: CopyOperationKind.AugmentedContent
+  path: string
+  writer: (out: Writable, written: string | undefined) => Promise<void>
+}
+
+export type CopyOperation =
+  | GitCopyOperation
+  | GitDirCopyOperation
+  | GitComponentCopyOperation
+  | GitTypeDirCompanionCopyOperation
+  | StreamedContentOperation
+  | AugmentedContentOperation
+
+// Handlers and collectors emit a HandlerResult describing only what they
+// themselves contributed: a flat, readonly sequence of manifest elements,
+// never a container shared with anyone else. `ChangeSet.from`
+// is the single construction path that folds this wire format into the
+// indexed read model consumed downstream by forPackageManifest /
+// forDestructiveManifest.
+export type HandlerResult = Readonly<{
+  elements: readonly ManifestElement[]
+  copies: readonly CopyOperation[]
+  warnings: readonly Error[]
+}>
+
+export const emptyResult = (): HandlerResult => ({
+  elements: [],
+  copies: [],
+  warnings: [],
+})
+
+export const mergeResults = (
+  ...results: readonly HandlerResult[]
+): HandlerResult => ({
+  elements: results.flatMap(r => r.elements),
+  copies: results.flatMap(r => r.copies),
+  warnings: results.flatMap(r => r.warnings),
+})

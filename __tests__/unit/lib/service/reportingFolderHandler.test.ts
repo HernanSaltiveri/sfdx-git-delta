@@ -1,15 +1,19 @@
 'use strict'
-import { describe, expect, it, jest } from '@jest/globals'
+import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { METAFILE_SUFFIX } from '../../../../src/constant/metadataConstants'
 import { MetadataRepository } from '../../../../src/metadata/MetadataRepository'
+import { getDefinition } from '../../../../src/metadata/metadataManager'
 import ReportingFolderHandler from '../../../../src/service/reportingFolderHandler'
-import type { Work } from '../../../../src/types/work'
-import { copyFiles, readDirs } from '../../../../src/utils/fsHelper'
-import { getGlobalMetadata, getWork } from '../../../__utils__/globalTestHelper'
+import type { Config } from '../../../../src/types/config'
+import {
+  CopyOperationKind,
+  ManifestTarget,
+} from '../../../../src/types/handlerResult'
+import { elementsOf } from '../../../__utils__/handlerResultView'
+import { createElement } from '../../../__utils__/testElement'
+import { getConfig, getContext } from '../../../__utils__/testWork'
 
-jest.mock('../../../../src/utils/fsHelper')
-const mockedReadDirs = jest.mocked(readDirs)
+vi.mock('../../../../src/utils/fsHelper')
 
 const entity = 'folder/test'
 const extension = 'report'
@@ -33,142 +37,255 @@ const objectType = {
 const testContext = [
   [
     `A       force-app/main/default/${objectType.directoryName}/${entity}.${extension}-meta.xml`,
-    new Set([entity]),
+    entity,
     'Report',
+    'force-app/main/default/reports/folder/test',
   ],
   [
     `A       force-app/main/default/${objectType.directoryName}/${entity}.reportFolder-meta.xml`,
-    new Set([entity]),
+    entity,
     'ReportFolder',
+    'force-app/main/default/reports/folder/test',
   ],
   [
     `A       force-app/main/default/${objectType.directoryName}/folder/${entity}.reportFolder-meta.xml`,
-    new Set([`folder/${entity}`]),
+    `folder/${entity}`,
     'ReportFolder',
+    'force-app/main/default/reports/folder/folder/test',
   ],
   [
     `A       force-app/main/default/${objectType.directoryName}/folder/folder/${entity}.reportFolder-meta.xml`,
-    new Set([`folder/folder/${entity}`]),
+    `folder/folder/${entity}`,
     'ReportFolder',
+    'force-app/main/default/reports/folder/folder/folder/test',
   ],
 ]
 
-let work: Work
+let config: Config
 beforeEach(() => {
-  jest.clearAllMocks()
-  work = getWork()
+  vi.clearAllMocks()
+  config = getConfig()
 })
 
 describe('InNestedFolderHandler', () => {
   let globalMetadata: MetadataRepository
   beforeAll(async () => {
-    globalMetadata = await getGlobalMetadata()
+    globalMetadata = await getDefinition({})
   })
 
-  describe.each(
-    testContext
-  )('when called with generateDelta false', (changePath:
-    | string
-    | Set<string>, expected: string | Set<string>, expectedType:
-    | string
-    | Set<string>) => {
-    beforeEach(() => {
-      work.config.generateDelta = false
-    })
-    it(`should not copy meta files nor copy special extension when adding ${expectedType}`, async () => {
-      // Arrange
-      const sut = new ReportingFolderHandler(
-        changePath as string,
-        objectType,
-        work,
-        globalMetadata
-      )
-
-      // Act
-      await sut.handleAddition()
-
-      // Assert
-      expect(work.diffs.package.get(expectedType as string)).toEqual(expected)
-      expect(copyFiles).not.toHaveBeenCalled()
-    })
-  })
-
-  describe.each(testContext)('when called with generateDelta true', (changePath:
-    | string
-    | Set<string>, expected: string | Set<string>, expectedType:
-    | string
-    | Set<string>) => {
-    beforeEach(() => {
-      work.config.generateDelta = true
-    })
-
-    describe(`when readDirs does not return files`, () => {
-      it(`should not copy special extension and copy meta files in addition ${expectedType}`, async () => {
-        // Arrange
-        const sut = new ReportingFolderHandler(
-          changePath as string,
-          objectType,
-          work,
-          globalMetadata
-        )
-        mockedReadDirs.mockImplementation(() => Promise.resolve([]))
-
-        // Act
-        await sut.handleAddition()
-
-        // Assert
-        expect(work.diffs.package.get(expectedType as string)).toEqual(expected)
-        expect(readDirs).toHaveBeenCalledTimes(1)
-        expect(copyFiles).toHaveBeenCalledTimes(3)
-        expect(copyFiles).toHaveBeenCalledWith(
-          work.config,
-          expect.stringContaining(METAFILE_SUFFIX)
-        )
+  describe.each(testContext)(
+    'when called with generateDelta false',
+    (changePath: string, expectedMember: string, expectedType: string) => {
+      beforeEach(() => {
+        config.generateDelta = false
       })
-    })
-
-    describe('when readDirs returns files', () => {
-      it('should copy special extension', async () => {
+      it(`should add manifest entry when adding ${expectedType}`, async () => {
         // Arrange
-        const sut = new ReportingFolderHandler(
-          changePath as string,
+        const { changeType, element } = createElement(
+          changePath,
           objectType,
-          work,
           globalMetadata
         )
-        mockedReadDirs.mockImplementationOnce(() =>
-          Promise.resolve([entity, 'not/matching'])
+        const sut = new ReportingFolderHandler(
+          changeType,
+          element,
+          getContext({ config })
         )
 
         // Act
-        await sut.handleAddition()
+        const result = await sut.collectAddition()
 
         // Assert
-        expect(work.diffs.package.get(expectedType as string)).toEqual(expected)
-        expect(readDirs).toHaveBeenCalledTimes(1)
-        expect(copyFiles).toHaveBeenCalledTimes(5)
+        expect(elementsOf(result)).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              target: ManifestTarget.Package,
+              type: expectedType,
+              member: expectedMember,
+            }),
+          ])
+        )
       })
-    })
-  })
+    }
+  )
+
+  describe.each(testContext)(
+    'Given generateDelta is true and %s',
+    (changePath: string, expectedMember: string, expectedType: string, componentPath: string) => {
+      beforeEach(() => {
+        config.generateDelta = true
+      })
+
+      it('When collectAddition, Then requests the component files once instead of listing the folder', async () => {
+        // Arrange
+        const { changeType, element } = createElement(
+          changePath,
+          objectType,
+          globalMetadata
+        )
+        const sut = new ReportingFolderHandler(
+          changeType,
+          element,
+          getContext({ config })
+        )
+
+        // Act
+        const result = await sut.collectAddition()
+
+        // Assert
+        expect(elementsOf(result)).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              target: ManifestTarget.Package,
+              type: expectedType,
+              member: expectedMember,
+            }),
+          ])
+        )
+        expect(
+          result.copies.filter(
+            c => c.kind === CopyOperationKind.GitComponentCopy
+          )
+        ).toEqual([
+          {
+            kind: CopyOperationKind.GitComponentCopy,
+            path: componentPath,
+            revision: config.to,
+          },
+        ])
+        expect(result.copies).toContainEqual({
+          kind: CopyOperationKind.GitCopy,
+          path: 'force-app/main/default/reports/folder-meta.xml',
+          revision: config.to,
+        })
+      })
+    }
+  )
 
   describe('when the line should not be processed', () => {
     it.each([
       `force-app/main/default/${objectType.directoryName}/test.otherExtension`,
     ])('does not handle the line', async entityPath => {
       // Arrange
-      const sut = new ReportingFolderHandler(
+      const { changeType, element } = createElement(
         `A       ${entityPath}`,
         objectType,
-        work,
         globalMetadata
+      )
+      const sut = new ReportingFolderHandler(
+        changeType,
+        element,
+        getContext({ config })
       )
 
       // Act
-      await sut.handle()
+      const result = await sut.collect()
 
       // Assert
-      expect(work.diffs.package.size).toBe(0)
-      expect(copyFiles).not.toHaveBeenCalled()
+      expect(elementsOf(result)).toEqual([])
+      expect(result.copies).toEqual([])
+    })
+  })
+
+  describe('when extension has no matching type in sharedFolderMetadata', () => {
+    it('should not add to package but still process the line', async () => {
+      // Arrange
+      const nestedPath = `force-app/main/default/${objectType.directoryName}/subfolder/test.unknownext-meta.xml`
+      config.generateDelta = false
+      const { changeType, element } = createElement(
+        `A       ${nestedPath}`,
+        objectType,
+        globalMetadata
+      )
+      const sut = new ReportingFolderHandler(
+        changeType,
+        element,
+        getContext({ config })
+      )
+
+      // Act
+      const result = await sut.collectAddition()
+
+      // Assert
+      expect(elementsOf(result)).toEqual([])
+    })
+
+    it('should throw when getElementDescriptor is called directly (kills L42 NoCoverage defensive guard)', async () => {
+      // Arrange — TypeHandlerFactory only ever routes to ReportingFolderHandler
+      // via a resolvable extension, so getElementDescriptor's guard is
+      // unreachable through the normal call chain; still a genuine safety
+      // net that must fail loudly rather than returning a bogus descriptor.
+      const nestedPath = `force-app/main/default/${objectType.directoryName}/subfolder/test.unknownext-meta.xml`
+      const { changeType, element } = createElement(
+        `A       ${nestedPath}`,
+        objectType,
+        globalMetadata
+      )
+      const sut = new ReportingFolderHandler(
+        changeType,
+        element,
+        getContext({ config })
+      )
+
+      // Act & Assert
+      expect(() => sut.getElementDescriptor()).toThrow(
+        `ReportingFolderHandler: resolvedType is missing for ${element.fullPath}`
+      )
+    })
+  })
+
+  describe('collectDeletion', () => {
+    it('should return destructive manifest entry when extension matches', async () => {
+      // Arrange
+      config.generateDelta = false
+      const deletionPath = `D       force-app/main/default/${objectType.directoryName}/${entity}.${extension}-meta.xml`
+      const { changeType, element } = createElement(
+        deletionPath,
+        objectType,
+        globalMetadata
+      )
+      const sut = new ReportingFolderHandler(
+        changeType,
+        element,
+        getContext({ config })
+      )
+
+      // Act
+      const result = await sut.collectDeletion()
+
+      // Assert
+      expect(elementsOf(result)).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            target: ManifestTarget.DestructiveChanges,
+            type: 'Report',
+            member: entity,
+          }),
+        ])
+      )
+    })
+
+    it('should return empty result when extension has no matching type', async () => {
+      // Arrange
+      config.generateDelta = false
+      const unknownPath = `D       force-app/main/default/${objectType.directoryName}/subfolder/test.unknownext-meta.xml`
+      const { changeType, element } = createElement(
+        unknownPath,
+        objectType,
+        globalMetadata
+      )
+      const sut = new ReportingFolderHandler(
+        changeType,
+        element,
+        getContext({ config })
+      )
+
+      // Act
+      const result = await sut.collectDeletion()
+
+      // Assert
+      expect(elementsOf(result)).toEqual([])
+      expect(result.copies).toEqual([])
     })
   })
 })

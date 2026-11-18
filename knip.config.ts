@@ -4,15 +4,21 @@ export default {
     'bin/dev.js',
     'bin/run.js',
     '**/*.{nut,test}.ts',
+    '__tests__/perf/**/*.{ts,mjs}',
+    'vitest.config.perf.ts',
     '.github/**/*.yml',
   ],
-  project: ['**/*.{ts,js,json,yml}', '!src/metadata/v*.ts'],
-  ignoreDependencies: [
-    '@salesforce/ts-sinon',
-    '@types/mocha',
-    'mocha',
-    'sinon',
-    'ts-jest-mock-import-meta',
+  project: ['**/*.{ts,js}', '!src/metadata/v*.ts'],
+  ignore: [
+    // Temporary directories created by mutation testing and AI tools
+    '.stryker-tmp/**',
+    '.claude/**',
+    // Config files that don't need analysis
+    '**/*.{json,yml,yaml}',
   ],
-  ignoreBinaries: ['npm-check-updates'],
+  // Schemas in src/schemas/metadata.ts and discriminated-union variants
+  // (CopyOperation, etc.) chain through one another in the same file —
+  // knip treats those as unused exports because nothing imports them
+  // directly. They are public surface for type derivation, so keep them.
+  ignoreExportsUsedInFile: true,
 }

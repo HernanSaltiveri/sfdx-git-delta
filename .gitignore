@@ -1,4 +1,5 @@
 .stryker-tmp
+.vitest
 .wireit
 *-debug.log
 *-error.log
@@ -7,10 +8,18 @@
 /lib
 /node_modules
 /reports
+/test
 install-state.gz
 megalinter-reports/
+# Nothing generates this any more, but a stale copy from an older publish must
+# never be committed: npm ci honours it over package-lock.json for the root
+# package, which would silently freeze CI's whole transitive tree.
+npm-shrinkwrap.json
 package.tgz
+perf-preview.html
 perf-result.txt
+perf-runtime.json
+perf-memory.json
 sfdx-git-delta-*.tgz
 stderr*.txt
 stdout*.txt

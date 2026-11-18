@@ -1,25 +1,26 @@
 'use strict'
-import { describe, expect, it, jest } from '@jest/globals'
-
+import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 import { MASTER_DETAIL_TAG } from '../../../../src/constant/metadataConstants'
 import { MetadataRepository } from '../../../../src/metadata/MetadataRepository'
+import { getDefinition } from '../../../../src/metadata/metadataManager'
 import CustomObjectHandler from '../../../../src/service/customObjectHandler'
-import type { Work } from '../../../../src/types/work'
+import type { Config } from '../../../../src/types/config'
 import {
-  copyFiles,
-  pathExists,
-  readDirs,
-  readPathFromGit,
-} from '../../../../src/utils/fsHelper'
-import { getGlobalMetadata, getWork } from '../../../__utils__/globalTestHelper'
+  CopyOperationKind,
+  ManifestTarget,
+} from '../../../../src/types/handlerResult'
+import { grepContentUnder, pathExists } from '../../../../src/utils/fsHelper'
+import { elementsOf } from '../../../__utils__/handlerResultView'
+import { createElement } from '../../../__utils__/testElement'
+import { getConfig, getContext } from '../../../__utils__/testWork'
 
-jest.mock('../../../../src/utils/fsHelper')
+vi.mock('../../../../src/utils/fsHelper')
 
-const mockedPathExist = jest.mocked(pathExists)
-const mockedReadDirs = jest.mocked(readDirs)
-const mockedReadPathFromGit = jest.mocked(readPathFromGit)
+const mockedPathExist = vi.mocked(pathExists)
+const mockedGrepContent = vi.mocked(grepContentUnder)
 
 mockedPathExist.mockResolvedValue(true)
+mockedGrepContent.mockResolvedValue([])
 
 const territoryModelType = {
   childXmlNames: ['Territory2Rule', 'Territory2'],
@@ -52,115 +53,174 @@ const objectType = {
 const line =
   'A       force-app/main/default/objects/Account/Account.object-meta.xml'
 
-let work: Work
+let config: Config
 beforeEach(() => {
-  jest.clearAllMocks()
-  work = getWork()
+  vi.clearAllMocks()
+  config = getConfig()
 })
 
 describe('CustomObjectHandler', () => {
   let globalMetadata: MetadataRepository
   beforeAll(async () => {
-    globalMetadata = await getGlobalMetadata()
+    globalMetadata = await getDefinition({})
   })
 
-  describe('when called with generateDelta false', () => {
-    it('should not handle master detail exception', async () => {
+  describe('collect', () => {
+    it('Given object addition with no master detail, When collect, Then returns manifest and file copy', async () => {
       // Arrange
-      work.config.generateDelta = false
-      const sut = new CustomObjectHandler(
+      mockedPathExist.mockResolvedValueOnce(false)
+      const { changeType, element } = createElement(
         line,
         objectType,
-        work,
         globalMetadata
+      )
+      const sut = new CustomObjectHandler(
+        changeType,
+        element,
+        getContext({ config })
       )
 
       // Act
-      await sut.handleAddition()
+      const result = await sut.collect()
 
       // Assert
+      expect(elementsOf(result)).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            target: ManifestTarget.Package,
+            type: 'CustomObject',
+            member: 'Account',
+          }),
+        ])
+      )
+      expect(
+        result.copies.some(c => c.kind === CopyOperationKind.GitCopy)
+      ).toBe(true)
+      expect(result.warnings).toHaveLength(0)
+    })
+
+    it('Given object addition with generateDelta false, When collect, Then returns manifest without master detail copies', async () => {
+      // Arrange
+      config.generateDelta = false
+      const { changeType, element } = createElement(
+        line,
+        objectType,
+        globalMetadata
+      )
+      const sut = new CustomObjectHandler(
+        changeType,
+        element,
+        getContext({ config })
+      )
+
+      // Act
+      const result = await sut.collect()
+
+      // Assert
+      expect(elementsOf(result)).toHaveLength(1)
+      expect(elementsOf(result)[0].target).toBe(ManifestTarget.Package)
+      expect(result.copies).toHaveLength(0)
+      expect(mockedPathExist).not.toHaveBeenCalled()
+      expect(mockedGrepContent).not.toHaveBeenCalled()
+    })
+
+    it('Given territory2Model addition, When collect, Then returns manifest without master detail check', async () => {
+      // Arrange
+      const { changeType, element } = createElement(
+        'A       force-app/main/default/territory2Models/EU/EU.territory2Model-meta.xml',
+        territoryModelType,
+        globalMetadata
+      )
+      const sut = new CustomObjectHandler(
+        changeType,
+        element,
+        getContext({ config })
+      )
+
+      // Act
+      const result = await sut.collect()
+
+      // Assert
+      expect(elementsOf(result)).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            target: ManifestTarget.Package,
+            type: 'Territory2Model',
+            member: 'EU',
+          }),
+        ])
+      )
+      expect(
+        result.copies.some(c => c.kind === CopyOperationKind.GitCopy)
+      ).toBe(true)
       expect(pathExists).not.toHaveBeenCalled()
-    })
-  })
-
-  describe('when called with generateDelta true', () => {
-    describe(`when called with not 'objects' type`, () => {
-      it('should not handle try to find master details fields', async () => {
-        // Arrange
-        const sut = new CustomObjectHandler(
-          'A       force-app/main/default/territory2Models/EU/EU.territory2Model-meta.xml',
-          territoryModelType,
-          work,
-          globalMetadata
-        )
-
-        // Act
-        await sut.handleAddition()
-
-        // Assert
-        expect(pathExists).not.toHaveBeenCalled()
-      })
+      expect(result.warnings).toHaveLength(0)
     })
 
-    describe('when field folder exist', () => {
-      describe('when field folder contains master details', () => {
-        it('should copy master detail fields', async () => {
-          // Arrange
-          mockedReadDirs.mockResolvedValueOnce(['Name.field-meta.xml'])
-          mockedReadPathFromGit.mockResolvedValueOnce(MASTER_DETAIL_TAG)
-          const sut = new CustomObjectHandler(
-            line,
-            objectType,
-            work,
-            globalMetadata
-          )
+    it('Given object addition with master detail fields, When collect, Then returns copies for master detail fields', async () => {
+      // Arrange
+      const masterDetailFieldPath =
+        'force-app/main/default/objects/Account/fields/ParentId__c.field-meta.xml'
+      mockedGrepContent.mockResolvedValueOnce([masterDetailFieldPath])
+      const { changeType, element } = createElement(
+        line,
+        objectType,
+        globalMetadata
+      )
+      const sut = new CustomObjectHandler(
+        changeType,
+        element,
+        getContext({ config })
+      )
 
-          // Act
-          await sut.handleAddition()
+      // Act
+      const result = await sut.collect()
 
-          // Assert
-          expect(copyFiles).toHaveBeenCalledTimes(2)
-        })
-      })
-
-      describe('when field folder does not contain master details', () => {
-        it('should not copy master detail fields', async () => {
-          // Arrange
-          mockedReadDirs.mockResolvedValue([])
-          mockedReadPathFromGit.mockResolvedValueOnce('')
-          const sut = new CustomObjectHandler(
-            line,
-            objectType,
-            work,
-            globalMetadata
-          )
-
-          // Act
-          await sut.handleAddition()
-
-          // Assert
-          expect(copyFiles).toHaveBeenCalledTimes(1)
-        })
-      })
+      // Assert
+      expect(mockedGrepContent).toHaveBeenCalledWith(
+        MASTER_DETAIL_TAG,
+        'force-app/main/default/objects/Account/fields',
+        expect.anything()
+      )
+      const gitCopies = result.copies.filter(
+        c => c.kind === CopyOperationKind.GitCopy
+      )
+      expect(gitCopies).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ path: masterDetailFieldPath }),
+        ])
+      )
+      expect(result.warnings).toHaveLength(0)
     })
 
-    describe('when field folder does not exist', () => {
-      it('should not look into the field folder', async () => {
-        // Arrange
-        mockedPathExist.mockResolvedValueOnce(false)
-        const sut = new CustomObjectHandler(
-          line,
-          objectType,
-          work,
-          globalMetadata
-        )
+    it('Given object addition under an object folder literally named "Custom[1]__c", When collect, Then grepContentUnder is called with the literal fields path', async () => {
+      // Arrange — a path containing `[` used to be classified as a glob and
+      // compiled into an invalid regex; the SyntaxError was swallowed into
+      // [], so a Master-Detail field silently failed to pull its parent
+      // object into the deployment. Assert the literal grep surface, not a
+      // derived path.
+      const bracketedLine =
+        'A       force-app/main/default/objects/Custom[1]__c/Custom[1]__c.object-meta.xml'
+      const { changeType, element } = createElement(
+        bracketedLine,
+        objectType,
+        globalMetadata
+      )
+      const sut = new CustomObjectHandler(
+        changeType,
+        element,
+        getContext({ config })
+      )
 
-        // Act
-        await sut.handleAddition()
+      // Act
+      await sut.collect()
 
-        // Assert
-        expect(readDirs).not.toHaveBeenCalled()
-      })
+      // Assert
+      expect(mockedGrepContent).toHaveBeenCalledWith(
+        MASTER_DETAIL_TAG,
+        'force-app/main/default/objects/Custom[1]__c/fields',
+        expect.anything()
+      )
     })
   })
 })

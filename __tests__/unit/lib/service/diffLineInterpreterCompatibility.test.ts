@@ -1,45 +1,56 @@
 'use strict'
 
-import { describe, expect, it, jest } from '@jest/globals'
+import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { MetadataRepository } from '../../../../src/metadata/MetadataRepository'
+import { getDefinition } from '../../../../src/metadata/metadataManager'
 import DiffLineInterpreter from '../../../../src/service/diffLineInterpreter'
-import type { Work } from '../../../../src/types/work'
-import { getGlobalMetadata, getWork } from '../../../__utils__/globalTestHelper'
+import type { Config } from '../../../../src/types/config'
+import { getConfig, getContext } from '../../../__utils__/testWork'
 
-jest.mock('node:os', () => ({
+vi.mock('node:os', async () => ({
+  ...((await vi.importActual('node:os')) as object),
   availableParallelism: null,
 }))
 
-const mockHandle = jest.fn()
-jest.mock('../../../../src/service/typeHandlerFactory', () => {
+import type { HandlerResult } from '../../../../src/types/handlerResult'
+import { emptyResult } from '../../../../src/types/handlerResult'
+
+const { mockCollect } = vi.hoisted(() => ({
+  mockCollect: vi.fn<() => Promise<HandlerResult>>(),
+}))
+
+vi.mock('../../../../src/service/typeHandlerFactory', () => {
   return {
-    default: jest.fn().mockImplementation(() => {
+    default: vi.fn().mockImplementation(function () {
       return {
-        getTypeHandler: jest
+        getTypeHandler: vi
           .fn()
-          .mockImplementation(() => ({ handle: mockHandle })),
+          .mockImplementation(async () => ({ collect: mockCollect })),
       }
     }),
   }
 })
 
-let work: Work
+let config: Config
 beforeEach(() => {
-  jest.clearAllMocks()
-  work = getWork()
+  vi.clearAllMocks()
+  mockCollect.mockResolvedValue(emptyResult())
+  config = getConfig()
 })
 
 describe('DiffLineInterpreter', () => {
   let sut: DiffLineInterpreter
   let globalMetadata: MetadataRepository
   beforeAll(async () => {
-    globalMetadata = await getGlobalMetadata()
+    globalMetadata = await getDefinition({})
   })
 
   describe('compatibility test', () => {
     beforeEach(() => {
-      sut = new DiffLineInterpreter(work, globalMetadata)
+      sut = new DiffLineInterpreter(
+        getContext({ config, metadata: globalMetadata })
+      )
     })
     describe('when `availableParallelism` is not defined', () => {
       it('fallback gracefully', async () => {
@@ -50,7 +61,7 @@ describe('DiffLineInterpreter', () => {
         await sut.process(lines)
 
         // Assert
-        expect(mockHandle).toHaveBeenCalledTimes(lines.length)
+        expect(mockCollect).toHaveBeenCalledTimes(lines.length)
       })
     })
   })

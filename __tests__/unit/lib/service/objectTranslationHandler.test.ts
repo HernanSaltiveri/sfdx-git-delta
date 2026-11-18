@@ -1,23 +1,36 @@
 'use strict'
-import { describe, expect, it, jest } from '@jest/globals'
+import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { MetadataRepository } from '../../../../src/metadata/MetadataRepository'
+import { getDefinition } from '../../../../src/metadata/metadataManager'
 import ObjectTranslation from '../../../../src/service/objectTranslationHandler'
-import type { Work } from '../../../../src/types/work'
-import { copyFiles, writeFile } from '../../../../src/utils/fsHelper'
-import { getGlobalMetadata, getWork } from '../../../__utils__/globalTestHelper'
+import type { Config } from '../../../../src/types/config'
+import {
+  CopyOperationKind,
+  ManifestTarget,
+} from '../../../../src/types/handlerResult'
+import { pathExists } from '../../../../src/utils/fsHelper'
+import { MetadataBoundaryResolver } from '../../../../src/utils/metadataBoundaryResolver'
+import type { DiffOutcome } from '../../../../src/utils/metadataDiff'
+import { elementsOf } from '../../../__utils__/handlerResultView'
+import { createElement } from '../../../__utils__/testElement'
+import { getConfig, getContext } from '../../../__utils__/testWork'
 
-const mockCompare = jest.fn()
-const mockprune = jest.fn()
-jest.mock('../../../../src/utils/metadataDiff', () => {
+const { mockRun, mockWriter } = vi.hoisted(() => ({
+  mockRun: vi.fn<() => Promise<DiffOutcome>>(),
+  mockWriter: vi.fn(),
+}))
+
+vi.mock('../../../../src/utils/metadataDiff', () => {
   return {
-    default: jest.fn().mockImplementation(() => {
-      return { compare: mockCompare, prune: mockprune }
+    default: vi.fn().mockImplementation(function () {
+      return { run: mockRun }
     }),
   }
 })
 
-jest.mock('../../../../src/utils/fsHelper')
+vi.mock('../../../../src/utils/fsHelper')
+const mockedPathExists = vi.mocked(pathExists)
 
 const objectType = {
   directoryName: 'objectTranslations',
@@ -27,93 +40,592 @@ const objectType = {
   xmlName: 'CustomObjectTranslation',
   pruneOnly: true,
 }
-const xmlName = 'CustomObjectTranslation'
 const line =
   'A       force-app/main/default/objectTranslations/Account-es/Account-es.objectTranslation-meta.xml'
+const parentObjectTranslationPath =
+  'force-app/main/default/objectTranslations/Account-es/Account-es.objectTranslation-meta.xml'
 
-const xmlContent = '<xmlContent>'
-mockprune.mockReturnValue({ xmlContent })
+// Flat layout: the objectTranslation file sits directly under the type
+// directory with no component sub-folder. SDR resolves it to the same
+// component (fullName 'Account-es') as the nested layout, so sgd must too.
+const flatLine =
+  'A       force-app/main/default/objectTranslations/Account-es.objectTranslation-meta.xml'
+const flatObjectTranslationPath =
+  'force-app/main/default/objectTranslations/Account-es.objectTranslation-meta.xml'
 
-let work: Work
+const typeDirectory = 'force-app/main/default/objectTranslations'
+const folderPath = `${typeDirectory}/Account-es`
+const fieldTranslationPath = `${folderPath}/Foo__c.fieldTranslation-meta.xml`
+
+let config: Config
 beforeEach(() => {
-  jest.clearAllMocks()
-  work = getWork()
+  vi.clearAllMocks()
+  mockedPathExists.mockReset()
+  mockRun.mockResolvedValue({
+    manifests: { added: [], modified: [], deleted: [] },
+    hasPackageContent: true,
+    writer: mockWriter,
+  })
+  config = getConfig()
 })
 
 describe('ObjectTranslation', () => {
   let globalMetadata: MetadataRepository
   beforeAll(async () => {
-    globalMetadata = await getGlobalMetadata()
+    globalMetadata = await getDefinition({})
   })
 
-  describe('when called with generateDelta false', () => {
-    it('should not copy files', async () => {
+  const resolveElement = (path: string) => {
+    const definition = globalMetadata.get(path)
+    if (!definition) throw new Error(`No metadata definition for ${path}`)
+    return new MetadataBoundaryResolver(
+      getContext({ config, metadata: globalMetadata })
+    ).createElement(path, definition, config.from)
+  }
+
+  describe('collect', () => {
+    it('Given objectTranslation addition, When collect, Then includes ComputedContent for pruned translation XML', async () => {
       // Arrange
-      work.config.generateDelta = false
-      const sut = new ObjectTranslation(line, objectType, work, globalMetadata)
-
-      // Act
-      await sut.handleAddition()
-
-      // Assert
-      expect(writeFile).not.toHaveBeenCalled()
-      expect(Array.from(work.diffs.package.get(xmlName)!)).toEqual([
-        'Account-es',
-      ])
-    })
-  })
-
-  describe('when called with generateDelta true', () => {
-    it('should copy object translations files', async () => {
-      // Arrange
-      const sut = new ObjectTranslation(line, objectType, work, globalMetadata)
-
-      // Act
-      await sut.handleAddition()
-
-      // Assert
-      expect(copyFiles).not.toHaveBeenCalled()
-      expect(writeFile).toHaveBeenCalledTimes(1)
-      expect(writeFile).toHaveBeenCalledWith(
-        expect.stringContaining('Account-es.objectTranslation'),
-        xmlContent,
-        work.config
+      const { changeType, element } = createElement(
+        line,
+        objectType,
+        globalMetadata
       )
-      expect(Array.from(work.diffs.package.get(xmlName)!)).toEqual([
-        'Account-es',
+      const sut = new ObjectTranslation(
+        changeType,
+        element,
+        getContext({ config })
+      )
+
+      // Act
+      const result = await sut.collect()
+
+      // Assert
+      expect(elementsOf(result)).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            target: ManifestTarget.Package,
+            type: 'CustomObjectTranslation',
+            member: 'Account-es',
+          }),
+        ])
+      )
+      expect(
+        result.copies.some(
+          c =>
+            c.kind === CopyOperationKind.StreamedContent &&
+            c.path.includes('Account-es.objectTranslation')
+        )
+      ).toBe(true)
+      expect(result.warnings).toHaveLength(0)
+    })
+
+    it('Given objectTranslation addition with generateDelta false, When collect, Then returns manifest without copies', async () => {
+      // Arrange
+      config.generateDelta = false
+      const { changeType, element } = createElement(
+        line,
+        objectType,
+        globalMetadata
+      )
+      const sut = new ObjectTranslation(
+        changeType,
+        element,
+        getContext({ config })
+      )
+
+      // Act
+      const result = await sut.collect()
+
+      // Assert
+      expect(elementsOf(result)).toHaveLength(1)
+      expect(elementsOf(result)[0].target).toBe(ManifestTarget.Package)
+      expect(result.copies).toHaveLength(0)
+    })
+
+    it('Given objectTranslation file addition, When collect, Then does NOT produce GitCopy operations', async () => {
+      // Arrange
+      const { changeType, element } = createElement(
+        line,
+        objectType,
+        globalMetadata
+      )
+      const sut = new ObjectTranslation(
+        changeType,
+        element,
+        getContext({ config })
+      )
+
+      // Act
+      const result = await sut.collect()
+
+      // Assert
+      expect(
+        result.copies.every(c => c.kind !== CopyOperationKind.GitCopy)
+      ).toBe(true)
+      expect(
+        result.copies.some(c => c.kind === CopyOperationKind.StreamedContent)
+      ).toBe(true)
+    })
+
+    it('Given objectTranslation addition with generateDelta true, When collect, Then _shouldCollectCopies allows ComputedContent', async () => {
+      // Arrange
+      config.generateDelta = true
+      const { changeType, element } = createElement(
+        line,
+        objectType,
+        globalMetadata
+      )
+      const sut = new ObjectTranslation(
+        changeType,
+        element,
+        getContext({ config })
+      )
+
+      // Act
+      const result = await sut.collect()
+
+      // Assert
+      expect(
+        result.copies.some(c => c.kind === CopyOperationKind.StreamedContent)
+      ).toBe(true)
+    })
+
+    it('Given writer is null, When collectAddition, Then does not push StreamedContent copy and pushes parent GitCopy', async () => {
+      // Arrange — writer is null, so the `if (writer)` guard must prevent pushing StreamedContent
+      // and the `else` branch must fall back to a parent GitCopy
+      config.generateDelta = true
+      // `writer: null` is deliberately out of DiffOutcome's contract (real
+      // producers only ever omit the key or supply a function — see
+      // MetadataDiff.run's `...(writer ? { writer } : {})`): it exercises
+      // the `if (writer)` guard against a second falsy value distinct from
+      // `undefined`, so a mutant weakening the guard to `!== undefined`
+      // would still be caught.
+      mockRun.mockResolvedValue({
+        manifests: { added: [], modified: [], deleted: [] },
+        hasPackageContent: true,
+        writer: null,
+      } as unknown as DiffOutcome)
+      const { changeType, element } = createElement(
+        line,
+        objectType,
+        globalMetadata
+      )
+      const sut = new ObjectTranslation(
+        changeType,
+        element,
+        getContext({ config })
+      )
+
+      // Act
+      const result = await sut.collectAddition()
+
+      // Assert
+      expect(
+        result.copies.some(c => c.kind === CopyOperationKind.StreamedContent)
+      ).toBe(false)
+      expect(
+        result.copies.some(
+          c =>
+            c.kind === CopyOperationKind.GitCopy &&
+            c.path === parentObjectTranslationPath
+        )
+      ).toBe(true)
+    })
+
+    it('Given fieldTranslation-only addition and writer undefined, When collectAddition, Then pushes parent GitCopy and no parent StreamedContent', async () => {
+      // Arrange — mirrors the #1341 regression: only a child fieldTranslation changed,
+      // parent has no surviving pruned content, so buildWriter returns undefined
+      config.generateDelta = true
+      // Key omitted, not set to `undefined`: mirrors how MetadataDiff.run
+      // actually builds DiffOutcome (`...(writer ? { writer } : {})`), and
+      // avoids exactOptionalPropertyTypes rejecting an explicit undefined.
+      mockRun.mockResolvedValue({
+        manifests: { added: [], modified: [], deleted: [] },
+        hasPackageContent: true,
+      })
+      const fieldTranslationLine =
+        'A       force-app/main/default/objectTranslations/Account-es/BillingFloor__c.fieldTranslation-meta.xml'
+      const { changeType, element } = createElement(
+        fieldTranslationLine,
+        objectType,
+        globalMetadata
+      )
+      const sut = new ObjectTranslation(
+        changeType,
+        element,
+        getContext({ config })
+      )
+
+      // Act
+      const result = await sut.collectAddition()
+
+      // Assert
+      expect(
+        result.copies.some(
+          c =>
+            c.kind === CopyOperationKind.GitCopy &&
+            c.path === parentObjectTranslationPath
+        )
+      ).toBe(true)
+      expect(
+        result.copies.some(
+          c =>
+            c.kind === CopyOperationKind.StreamedContent &&
+            c.path === parentObjectTranslationPath
+        )
+      ).toBe(false)
+    })
+
+    it('Given fieldTranslation-only addition, When collectAddition, Then does not push a copy for an unresolved parent meta path', async () => {
+      // Arrange — the inherited meta-file copy must not emit a bogus "undefined.*"
+      // path; the parent objectTranslation is handled by the writer/fallback branch
+      config.generateDelta = true
+      // Key omitted, not set to `undefined`: mirrors how MetadataDiff.run
+      // actually builds DiffOutcome (`...(writer ? { writer } : {})`), and
+      // avoids exactOptionalPropertyTypes rejecting an explicit undefined.
+      mockRun.mockResolvedValue({
+        manifests: { added: [], modified: [], deleted: [] },
+        hasPackageContent: true,
+      })
+      const fieldTranslationLine =
+        'A       force-app/main/default/objectTranslations/Account-es/BillingFloor__c.fieldTranslation-meta.xml'
+      const { changeType, element } = createElement(
+        fieldTranslationLine,
+        objectType,
+        globalMetadata
+      )
+      const sut = new ObjectTranslation(
+        changeType,
+        element,
+        getContext({ config })
+      )
+
+      // Act
+      const result = await sut.collectAddition()
+
+      // Assert
+      expect(result.copies.some(c => c.path.includes('undefined'))).toBe(false)
+    })
+
+    it('Given flat-layout objectTranslation addition, When collect, Then member is the component name without the file extension', async () => {
+      // Arrange
+      const { changeType, element } = createElement(
+        flatLine,
+        objectType,
+        globalMetadata
+      )
+      const sut = new ObjectTranslation(
+        changeType,
+        element,
+        getContext({ config })
+      )
+
+      // Act
+      const result = await sut.collect()
+
+      // Assert
+      expect(elementsOf(result)).toEqual([
+        expect.objectContaining({
+          target: ManifestTarget.Package,
+          type: 'CustomObjectTranslation',
+          member: 'Account-es',
+        }),
+      ])
+      expect(result.warnings).toHaveLength(0)
+    })
+
+    it('Given flat-layout objectTranslation addition, When collect, Then the StreamedContent copy targets the file itself', async () => {
+      // Arrange
+      config.generateDelta = true
+      const { changeType, element } = createElement(
+        flatLine,
+        objectType,
+        globalMetadata
+      )
+      const sut = new ObjectTranslation(
+        changeType,
+        element,
+        getContext({ config })
+      )
+
+      // Act
+      const result = await sut.collect()
+
+      // Assert
+      expect(
+        result.copies.some(
+          c =>
+            c.kind === CopyOperationKind.StreamedContent &&
+            c.path === flatObjectTranslationPath
+        )
+      ).toBe(true)
+    })
+
+    it('Given flat-layout objectTranslation addition and writer undefined, When collectAddition, Then the fallback GitCopy targets the file itself', async () => {
+      // Arrange — the key is omitted rather than set to `undefined`, which is
+      // both what `MetadataDiff.run` actually produces (`...(writer ? { writer } : {})`)
+      // and the only spelling `exactOptionalPropertyTypes` accepts.
+      config.generateDelta = true
+      mockRun.mockResolvedValue({
+        manifests: { added: [], modified: [], deleted: [] },
+        hasPackageContent: true,
+      })
+      const { changeType, element } = createElement(
+        flatLine,
+        objectType,
+        globalMetadata
+      )
+      const sut = new ObjectTranslation(
+        changeType,
+        element,
+        getContext({ config })
+      )
+
+      // Act
+      const result = await sut.collectAddition()
+
+      // Assert
+      expect(
+        result.copies.some(
+          c =>
+            c.kind === CopyOperationKind.GitCopy &&
+            c.path === flatObjectTranslationPath
+        )
+      ).toBe(true)
+      expect(
+        result.copies.some(c => c.path.includes('objectTranslations.'))
+      ).toBe(false)
+    })
+
+    it('Given flat-layout objectTranslation deletion, When collect, Then destructive member is the component name', async () => {
+      // Arrange
+      mockedPathExists.mockResolvedValue(false)
+      const { changeType, element } = createElement(
+        flatLine.replace('A ', 'D '),
+        objectType,
+        globalMetadata
+      )
+      const sut = new ObjectTranslation(
+        changeType,
+        element,
+        getContext({ config })
+      )
+
+      // Act
+      const result = await sut.collect()
+
+      // Assert
+      expect(elementsOf(result)).toEqual([
+        expect.objectContaining({
+          target: ManifestTarget.DestructiveChanges,
+          type: 'CustomObjectTranslation',
+          member: 'Account-es',
+        }),
+      ])
+      expect(mockedPathExists).toHaveBeenCalledWith(
+        folderPath,
+        expect.anything()
+      )
+      expect(mockedPathExists).not.toHaveBeenCalledWith(
+        typeDirectory,
+        expect.anything()
+      )
+    })
+
+    it('Given sub-folder fieldTranslation deletion and the component folder exists at to, When collect, Then the component is packaged with its parent translation file', async () => {
+      // Arrange
+      const element = await resolveElement(fieldTranslationPath)
+      mockedPathExists.mockImplementation(async path => path === folderPath)
+      const sut = new ObjectTranslation('D', element, getContext({ config }))
+
+      // Act
+      const result = await sut.collect()
+
+      // Assert
+      expect(elementsOf(result)).toEqual([
+        expect.objectContaining({
+          target: ManifestTarget.Package,
+          type: 'CustomObjectTranslation',
+          member: 'Account-es',
+        }),
+      ])
+      expect(mockedPathExists).toHaveBeenCalledWith(
+        folderPath,
+        expect.anything()
+      )
+      expect(
+        result.copies.some(
+          c =>
+            c.kind === CopyOperationKind.StreamedContent &&
+            c.path === parentObjectTranslationPath
+        )
+      ).toBe(true)
+      expect(result.warnings).toHaveLength(0)
+    })
+
+    it('Given sub-folder fieldTranslation deletion and the folder is gone at to, When collect, Then the component is destructive', async () => {
+      // Arrange
+      const element = await resolveElement(fieldTranslationPath)
+      mockedPathExists.mockResolvedValue(false)
+      const sut = new ObjectTranslation('D', element, getContext({ config }))
+
+      // Act
+      const result = await sut.collect()
+
+      // Assert
+      expect(elementsOf(result)).toEqual([
+        expect.objectContaining({
+          target: ManifestTarget.DestructiveChanges,
+          type: 'CustomObjectTranslation',
+          member: 'Account-es',
+        }),
       ])
     })
 
-    describe('when called with fieldTranslation', () => {
-      const fieldTranslationline =
+    it('Given sub-folder parent file deletion and the folder survives at to, When collect, Then the component is packaged and nothing warns', async () => {
+      // Arrange
+      const element = await resolveElement(parentObjectTranslationPath)
+      mockedPathExists.mockImplementation(async path => path === folderPath)
+      const sut = new ObjectTranslation('D', element, getContext({ config }))
+
+      // Act
+      const result = await sut.collect()
+
+      // Assert
+      expect(mockedPathExists).toHaveBeenCalledWith(
+        folderPath,
+        expect.anything()
+      )
+      expect(elementsOf(result)).toEqual([
+        expect.objectContaining({
+          target: ManifestTarget.Package,
+          type: 'CustomObjectTranslation',
+          member: 'Account-es',
+        }),
+      ])
+      expect(result.warnings).toHaveLength(0)
+    })
+
+    it('Given fieldTranslation addition, When collect, Then includes both file copies and ComputedContent', async () => {
+      // Arrange
+      const fieldTranslationLine =
         'A       force-app/main/default/objectTranslations/Account-es/BillingFloor__c.fieldTranslation-meta.xml'
-      it('should copy object translations files and fieldTranslation', async () => {
-        // Arrange
-        const sut = new ObjectTranslation(
-          fieldTranslationline,
-          objectType,
-          work,
-          globalMetadata
+      const { changeType, element } = createElement(
+        fieldTranslationLine,
+        objectType,
+        globalMetadata
+      )
+      const sut = new ObjectTranslation(
+        changeType,
+        element,
+        getContext({ config })
+      )
+
+      // Act
+      const result = await sut.collect()
+
+      // Assert
+      expect(elementsOf(result)).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            target: ManifestTarget.Package,
+            type: 'CustomObjectTranslation',
+            member: 'Account-es',
+          }),
+        ])
+      )
+      expect(
+        result.copies.some(c => c.kind === CopyOperationKind.StreamedContent)
+      ).toBe(true)
+      expect(
+        result.copies.some(c => c.kind === CopyOperationKind.GitCopy)
+      ).toBe(true)
+      expect(result.warnings).toHaveLength(0)
+    })
+
+    describe('Given two fieldTranslation additions of one parent', () => {
+      const lines = [
+        'A       force-app/main/default/objectTranslations/Account-es/Foo__c.fieldTranslation-meta.xml',
+        'A       force-app/main/default/objectTranslations/Account-es/Bar__c.fieldTranslation-meta.xml',
+      ]
+      const handlersOn = (contexts: ReturnType<typeof getContext>[]) =>
+        lines.map((fieldLine, index) => {
+          const { changeType, element } = createElement(
+            fieldLine,
+            objectType,
+            globalMetadata
+          )
+          return new ObjectTranslation(changeType, element, contexts[index]!)
+        })
+      const writersOf = (
+        results: Awaited<ReturnType<ObjectTranslation['collect']>>[]
+      ) =>
+        results.map(
+          r =>
+            r.copies.find(
+              c => c.kind === CopyOperationKind.StreamedContent
+            ) as {
+              writer: unknown
+            }
         )
+
+      it('When both collect concurrently on one context, Then MetadataDiff.run runs once and both StreamedContent copies carry the same writer', async () => {
+        // Arrange
+        const ctx = getContext({ config })
+        const [first, second] = handlersOn([ctx, ctx])
 
         // Act
-        await sut.handleAddition()
+        const results = await Promise.all([first!.collect(), second!.collect()])
 
         // Assert
-        expect(copyFiles).toHaveBeenCalledTimes(2)
-        expect(copyFiles).toHaveBeenCalledWith(
-          work.config,
-          expect.stringContaining('BillingFloor__c.fieldTranslation')
-        )
-        expect(writeFile).toHaveBeenCalledTimes(1)
-        expect(writeFile).toHaveBeenCalledWith(
-          expect.stringContaining('Account-es.objectTranslation'),
-          xmlContent,
-          work.config
-        )
-        expect(Array.from(work.diffs.package.get(xmlName)!)).toEqual([
-          'Account-es',
+        expect(mockRun).toHaveBeenCalledTimes(1)
+        const [firstCopy, secondCopy] = writersOf(results)
+        expect(firstCopy!.writer).toBe(mockWriter)
+        expect(secondCopy!.writer).toBe(firstCopy!.writer)
+      })
+
+      it('When both collect on two contexts, Then MetadataDiff.run runs twice', async () => {
+        // Arrange
+        const [first, second] = handlersOn([
+          getContext({ config }),
+          getContext({ config }),
         ])
+
+        // Act
+        await Promise.all([first!.collect(), second!.collect()])
+
+        // Assert
+        expect(mockRun).toHaveBeenCalledTimes(2)
+      })
+
+      it('When the parent diff rejects, Then each child returns its own warning and no parent copy', async () => {
+        // Arrange
+        mockRun.mockRejectedValue(new Error('boom'))
+        const ctx = getContext({ config })
+        const [first, second] = handlersOn([ctx, ctx])
+
+        // Act
+        const results = await Promise.all([first!.collect(), second!.collect()])
+
+        // Assert
+        expect(results.map(r => r.warnings)).toEqual([
+          [
+            expect.objectContaining({
+              message: expect.stringMatching(/Foo__c.*boom/),
+            }),
+          ],
+          [
+            expect.objectContaining({
+              message: expect.stringMatching(/Bar__c.*boom/),
+            }),
+          ],
+        ])
+        expect(
+          results
+            .flatMap(r => r.copies)
+            .some(c => c.kind === CopyOperationKind.StreamedContent)
+        ).toBe(false)
       })
     })
   })

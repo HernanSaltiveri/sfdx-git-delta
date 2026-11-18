@@ -1,30 +1,57 @@
 'use strict'
-import { beforeAll, describe, expect, it } from '@jest/globals'
+import { beforeAll, describe, expect, it } from 'vitest'
 
 import { MetadataRepository } from '../../../../src/metadata/MetadataRepository'
-import BaseProcessor from '../../../../src/post-processor/baseProcessor'
-import type { Work } from '../../../../src/types/work'
-import { getGlobalMetadata, getWork } from '../../../__utils__/globalTestHelper'
+import { getDefinition } from '../../../../src/metadata/metadataManager'
+import BaseProcessor, {
+  emptyOutcome,
+  type ProcessorOutcome,
+} from '../../../../src/post-processor/baseProcessor'
+import ChangeSet from '../../../../src/utils/changeSet'
+import { elementsOf } from '../../../__utils__/handlerResultView'
+import { getConfig, getContext } from '../../../__utils__/testWork'
+
+class TestProcessor extends BaseProcessor {
+  public override async process(
+    _changes: ChangeSet
+  ): Promise<ProcessorOutcome> {
+    return emptyOutcome()
+  }
+}
 
 describe('BaseProcessor', () => {
-  let work: Work, metadata: MetadataRepository
+  let metadata: MetadataRepository
   beforeAll(async () => {
-    work = getWork()
-    metadata = await getGlobalMetadata()
+    metadata = await getDefinition({})
   })
-  describe('when process is called', () => {
-    it('throws an error', async () => {
+
+  describe('isCollector', () => {
+    it('Given default base processor, When isCollector, Then returns false', () => {
       // Arrange
-      expect.assertions(1)
-      const sut = new BaseProcessor(work, metadata)
+      const config = getConfig()
+      const sut = new TestProcessor(getContext({ config, metadata }))
 
       // Act
-      try {
-        await sut.process()
-      } catch (error) {
-        // Assert
-        expect((error as Error).message).toEqual('this class should be derived')
-      }
+      const result = sut.isCollector
+
+      // Assert
+      expect(result).toBe(false)
+    })
+  })
+
+  describe('transformAndCollect', () => {
+    it('Given default base processor, When transformAndCollect, Then returns empty result', async () => {
+      // Arrange
+      const config = getConfig()
+      const sut = new TestProcessor(getContext({ config, metadata }))
+
+      // Act
+      const result = await sut.transformAndCollect(new ChangeSet())
+
+      // Assert
+      expect(elementsOf(result)).toEqual([])
+      expect(result.copies).toEqual([])
+      expect(result.warnings).toEqual([])
     })
   })
 })

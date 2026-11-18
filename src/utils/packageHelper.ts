@@ -1,56 +1,57 @@
 'use strict'
-import { create } from 'xmlbuilder2'
+import type { Writable } from 'node:stream'
 
-import { OBJECT_TYPE } from '../constant/metadataConstants.js'
 import type { Config } from '../types/config.js'
 import type { Manifest } from '../types/work.js'
 import { log } from './LoggingDecorator.js'
+import type { RootCapture } from './metadataDiff/xmlEventReader.js'
+import { writeXmlDocument } from './metadataDiff/xmlWriter.js'
 
-const xmlConf = { indent: '    ', newline: '\n', prettyPrint: true }
 const frLocale = 'fr'
+const collator = new Intl.Collator(frLocale)
+const ROOT_ATTRIBUTES = {
+  '@_xmlns': 'http://soap.sforce.com/2006/04/metadata',
+}
+const XML_HEADER = {
+  '?xml': { '@_version': '1.0', '@_encoding': 'UTF-8' },
+}
+
+type TypeBlock = { members: string[]; name: string }
 
 export default class PackageBuilder {
   constructor(protected readonly config: Config) {}
 
   @log
-  public buildPackage(strucDiffPerType: Manifest) {
-    const xml = create({ version: '1.0', encoding: 'UTF-8' }).ele('Package', {
-      xmlns: 'http://soap.sforce.com/2006/04/metadata',
+  public async buildPackageStream(
+    strucDiffPerType: Manifest,
+    out: Writable
+  ): Promise<void> {
+    const typesBlocks = this._buildTypesBlocks(strucDiffPerType)
+    const rootChildren: [string, unknown][] = [
+      ...typesBlocks.map(block => ['types', block] as [string, unknown]),
+      ['version', `${this.config.apiVersion}.0`] as [string, unknown],
+    ]
+    const capture: RootCapture = {
+      xmlHeader: XML_HEADER,
+      rootKey: 'Package',
+      rootAttributes: ROOT_ATTRIBUTES,
+    }
+    await writeXmlDocument(out, capture, rootChildren, {
+      trailingNewline: false,
+      // Member names are raw domain data (from the diff handlers); escape
+      // XML-significant characters so the manifest stays valid XML.
+      escape: true,
     })
-    Array.from(strucDiffPerType.keys())
-      .sort(this._sortTypesWithMetadata)
-      .forEach(metadataType =>
-        [...strucDiffPerType.get(metadataType)!]
-          .sort(Intl.Collator(frLocale).compare)
-          .reduce((type, member) => {
-            type.ele('members').txt(member)
-            return type
-          }, xml.ele('types'))
-          .ele('name')
-          .txt(metadataType)
-      )
-    xml.ele('version').txt(`${this.config.apiVersion}.0`)
-    return xml.end(xmlConf)
   }
 
-  _sortTypesWithMetadata = (x: string, y: string) => {
-    // QUESTION: Why Object needs to be ordered first in package.xml so it can be deployed ?
-    if (x === OBJECT_TYPE) return -1 // @deprecated To remove when the order will not impact the result of the deployment
-    return new Intl.Collator(frLocale).compare(x, y)
+  protected _buildTypesBlocks(strucDiffPerType: Manifest): TypeBlock[] {
+    return Array.from(strucDiffPerType.keys())
+      .sort(collator.compare)
+      .map(metadataType => ({
+        members: [...strucDiffPerType.get(metadataType)!].sort(
+          collator.compare
+        ),
+        name: metadataType,
+      }))
   }
-}
-
-export const fillPackageWithParameter = ({
-  store,
-  type,
-  member,
-}: {
-  store: Manifest
-  type: string
-  member: string
-}) => {
-  if (!store.has(type)) {
-    store.set(type, new Set())
-  }
-  store.get(type)?.add(member)
 }

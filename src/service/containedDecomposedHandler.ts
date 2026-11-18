@@ -1,92 +1,86 @@
 'use strict'
 import { join, ParsedPath, parse } from 'node:path/posix'
 import { PATH_SEP } from '../constant/fsConstants.js'
-import {
-  METAFILE_SUFFIX,
-  PERMISSIONSET_OBJECTSETTINGS_FOLDER,
-} from '../constant/metadataConstants.js'
-import { MetadataRepository } from '../metadata/MetadataRepository.js'
-import { Metadata } from '../types/metadata.js'
-import { Work } from '../types/work.js'
+import { METAFILE_SUFFIX } from '../constant/metadataConstants.js'
+import type { CopyOperation, HandlerResult } from '../types/handlerResult.js'
+import { CopyOperationKind } from '../types/handlerResult.js'
+import type { RunContext } from '../types/runContext.js'
 import { readDirs } from '../utils/fsHelper.js'
-import { log } from '../utils/LoggingDecorator.js'
+import type { MetadataElement } from '../utils/metadataElement.js'
 import StandardHandler from './standardHandler.js'
+
+// In .../PSName/childTypeDir/file, the PS name is 3 segments before the end
+const PS_DIR_OFFSET_IN_SUBDIR = 3
+// In .../PSName/file, the PS name is 2 segments before the end
+const PS_DIR_OFFSET_FLAT = 2
 
 export default class ContainedDecomposedHandler extends StandardHandler {
   protected holderFolder: ParsedPath | undefined
 
-  constructor(
-    line: string,
-    metadataDef: Metadata,
-    work: Work,
-    metadata: MetadataRepository
-  ) {
-    super(line, metadataDef, work, metadata)
+  constructor(changeType: string, element: MetadataElement, ctx: RunContext) {
+    super(changeType, element, ctx)
     this._setholderFolder()
   }
 
-  @log
-  public override async handleAddition() {
-    await super.handleAddition()
-    if (!this.config.generateDelta) return
-
-    // For decomposed format, copy all related files
-    if (this._isDecomposedFormat()) {
-      await this._copyDecomposedFiles()
-    }
+  public override async collectAddition(): Promise<HandlerResult> {
+    const result = await super.collectAddition()
+    if (!this._isDecomposedFormat()) return result
+    const copies = [...result.copies]
+    this._collectDirCopy(copies, this._getHolderPath())
+    return { ...result, copies }
   }
 
-  @log
-  public override async handleDeletion() {
+  public override async collectDeletion(): Promise<HandlerResult> {
     if (!this._isDecomposedFormat()) {
-      await super.handleDeletion()
-      return
+      return await super.collectDeletion()
     }
-
     if (await this._hasRelatedContent()) {
-      await this.handleModification()
-    } else {
-      await super.handleDeletion()
+      return await this.collectModification()
     }
+    return await super.collectDeletion()
   }
 
   protected _setholderFolder() {
     if (!this._isDecomposedFormat()) {
       this.holderFolder = parse(
-        this.line
+        this.element.basePath
           .replace(METAFILE_SUFFIX, '')
-          .replace(`.${this.metadataDef.suffix}`, '')
+          .replace(`.${this.element.type.suffix}`, '')
       )
       return
     }
-    // Get the parent folder name from the path
-    const parentFolderName = this.splittedLine.at(-2)
-
-    // If parent folder is objectSettings, use the grandparent folder name
-    // Otherwise use the parent folder name
-    const index =
-      parentFolderName === PERMISSIONSET_OBJECTSETTINGS_FOLDER ? -2 : -1
-
-    this.holderFolder = parse(this.splittedLine.slice(0, index).join(PATH_SEP))
+    const isFlat = this.element.componentName === this.element.parentFolder
+    const offset = isFlat ? PS_DIR_OFFSET_FLAT : PS_DIR_OFFSET_IN_SUBDIR
+    const psDirIndex = this.element.parts.length - offset
+    this.holderFolder = parse(
+      this.element.parts.slice(0, psDirIndex + 1).join(PATH_SEP)
+    )
   }
 
   protected _isDecomposedFormat() {
+    const parsed = parse(this.element.basePath)
     return (
-      !this.parsedLine.base.includes(`.${this.metadataDef.suffix}`) ||
-      this.parsedLine.dir.split(PATH_SEP).pop() === this.parsedLine.name
+      !parsed.base.includes(`.${this.element.type.suffix}`) ||
+      parsed.dir.split(PATH_SEP).pop() === parsed.name
     )
+  }
+
+  protected _collectDirCopy(copies: CopyOperation[], path: string): void {
+    if (!this._shouldCollectCopies()) return
+    copies.push({
+      kind: CopyOperationKind.GitDirCopy,
+      path,
+      revision: this.config.to,
+    })
+  }
+
+  protected _getHolderPath(): string {
+    return join(this.holderFolder!.dir, this.holderFolder!.base)
   }
 
   protected async _hasRelatedContent(): Promise<boolean> {
-    const files = await readDirs(
-      join(this.holderFolder!.dir, this.holderFolder!.base),
-      this.config
-    )
+    const files = await readDirs(this._getHolderPath(), this.ctx)
     return files.length > 0
-  }
-
-  protected async _copyDecomposedFiles() {
-    await this._copy(join(this.holderFolder!.dir, this.holderFolder!.base))
   }
 
   protected override _getElementName() {

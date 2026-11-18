@@ -1,10 +1,8 @@
 <!-- markdownlint-disable MD040 MD041 -->
 ![Actions Status](https://github.com/scolladon/sfdx-git-delta/workflows/Main/badge.svg)
-[![Performance Dashboard](https://img.shields.io/static/v1?label=Performance&message=Dashboard&color=blue)](https://scolladon.github.io/sfdx-git-delta/dev/bench/)
+[![Performance Dashboard](https://img.shields.io/badge/Performance-Dashboard-58a6ff)](https://scolladon.github.io/sfdx-git-delta/dev/bench/runtime/)
 [![npm](https://badgen.net/npm/v/sfdx-git-delta)](https://badgen.net/npm/v/sfdx-git-delta)
-[![Maintainability](https://api.codeclimate.com/v1/badges/95619399c7bb2cf60da4/maintainability)](https://codeclimate.com/github/scolladon/sfdx-git-delta/maintainability)
 [![Code Coverage](https://codecov.io/gh/scolladon/sfdx-git-delta/branch/main/graph/badge.svg?token=92T8XKKBHN)](https://codecov.io/gh/scolladon/sfdx-git-delta)
-[![Known Vulnerabilities](https://snyk.io//test/github/scolladon/sfdx-git-delta/badge.svg?targetFile=package.json)](https://snyk.io//test/github/scolladon/sfdx-git-delta?targetFile=package.json)
 [![downloads](https://badgen.net/npm/dw/sfdx-git-delta)](https://badgen.net/npm/dw/sfdx-git-delta)
 ![GitHub Sponsors](https://img.shields.io/github/sponsors/scolladon)
 
@@ -26,6 +24,9 @@
 
 > [!WARNING]
 > **Potentially breaking changes in v6**: Check out the [v6 migration guide](docs/migrating-to-v6.0.0.md) to see how you could be impacted by some changes in the new major `v6` version of the plugin, and how to migrate to this version.
+
+> [!WARNING]
+> **Breaking change for programmatic consumers**: `Config.mergeBase` is now a required field. Add `mergeBase: false` to your config to preserve today's behavior. See the [merge-base migration guide](docs/migrating-config-merge-base.md) for details.
 
 <!-- TABLE OF CONTENTS -->
 <details>
@@ -52,11 +53,13 @@
   - [Exclude some metadata only from destructiveChanges.xml](#exclude-some-metadata-only-from-destructivechangesxml)
   - [Explicitly including specific files for inclusion or destruction regardless of diff](#explicitly-including-specific-files-for-inclusion-or-destruction-regardless-of-diff)
   - [Scoping delta generation to a specific folder](#scoping-delta-generation-to-a-specific-folder)
-  - [Generate a comma-separated list of the added and modified Apex classes](#generate-a-comma-separated-list-of-the-added-and-modified-apex-classes)
+  - [Scope delta generation to the sfdx-project.json package directories](#scope-delta-generation-to-the-sfdx-projectjson-package-directories)
+  - [Run specified tests using the SGD manifest](#run-specified-tests-using-the-sgd-manifest)
   - [Condition deployment on package.xml and destructiveChange content](#condition-deployment-on-packagexml-and-destructivechange-content)
   - [Use the module in your own node application](#use-the-module-in-your-own-node-application)
   - [Handle flow deletion](#handle-flow-deletion)
-- [Complementary Plugins](#complementary-plugins)
+  - [Decomposed Metadata Types](#decomposed-metadata-types)
+  - [Debugging](#debugging)
 - [Changelog](#changelog)
 - [Built With](#built-with)
 - [Used by](#used-by)
@@ -88,7 +91,7 @@ sf project deploy start -x package/package.xml --post-destructive-changes destru
 
 - **Automate destructive deployments**: build the destructiveChanges.xml from the deleted (or renamed) metadata
 
-Have a look at this post on the Salesforce Developers Blog to dive into it: [Optimizing Unpackaged Deployments Using a Delta Generation Tool](https://developer.salesforce.com/blogs/2021/01/optimizing-unpackaged-deployments-using-a-delta-generation-tool.html).
+Have a look at this post on the Salesforce Developers Blog to dive into it: [Optimizing Unpackaged Deployments Using a Delta Generation Tool](https://developer.salesforce.com/blogs/2021/01/optimizing-unpackaged-deployments-using-a-delta-generation-tool).
 
 ![delta_principle](img/delta_principles.png)
 
@@ -96,11 +99,12 @@ Have a look at this post on the Salesforce Developers Blog to dive into it: [Opt
 
 If you are not a Salesforce Architect or Developer, probably not, _sorry_.
 
-If you are a Technical Architect or Developer, then it’s a very useful tool for you, when meeting the 3 conditions below:
+If you are a Technical Architect or Developer, then it’s a very useful tool for you, when meeting the 4 conditions below:
 
 1. Your Salesforce project uses a git repo as the source of truth.
 2. You use the Source (DX) format in the repo.
 3. Your metadata is unmanaged (in other words, you are not building a managed or unlocked package).
+4. Your repository is deployable at both `--from` and `--to`. A state that cannot be deployed (for example, two files declaring the same component in one package directory) gives an unspecified delta.
 
 SGD is designed to be part of a CI/CD pipeline (Jenkins, Bitbucket Pipelines, GitLab CI, GitHub Actions, Azure DevOps...) that handles the deployment of the sources to the Salesforce org(s).
 
@@ -117,10 +121,10 @@ It's also important to implement a way to switch back to full deployment in case
 
 ### Prerequisites
 
-The plugin requires git command line on the running environment.
+No `git` binary is required: the plugin reads the repository's git object store in-process, including `--ref-format=reftable` and `--object-format=sha256` repositories (the latter isn't hosted by GitHub or GitLab today, so you're unlikely to run into one).
 
-**Node v20 or above is required**.
-To check if Salesforce CLI runs under a supported node version for SGD, run `sf --version`. You should see a node version above v20 to use SGD.
+**Node v22 or above is required**.
+To check if Salesforce CLI runs under a supported node version for SGD, run `sf --version`. You should see a node version of v22 or above to use SGD.
 
 If you encounter this issue whereas the node version is OK on the running environment, try to [install the Salesforce CLI via npm](https://developer.salesforce.com/docs/atlas.en-us.sfdx_setup.meta/sfdx_setup/sfdx_setup_install_cli.htm#sfdx_setup_install_cli_npm) (`npm install @salesforce/cli --global`).
 
@@ -147,23 +151,28 @@ Generate incremental package manifest and source content
 
 ```
 USAGE
-  $ sf sgd source delta -f <value> [--json] [--flags-dir <value>] [-t <value>] [-d] [-o <value>] [-r <value>] [-s
-    <value>...] [-i <value>] [-D <value>] [-n <value>] [-N <value>] [-W] [-a <value>]
+  $ sf sgd source delta -f <value> [--json] [--flags-dir <value>] [-t <value>] [-b] [-d] [-o <value>] [-r <value>] [-s
+    <value>...] [-i <value>] [-D <value>] [-n <value>] [-N <value>] [-M <value>] [-c <value>] [-W] [-a <value>]
 
 FLAGS
-  -D, --ignore-destructive-file=<value>   file listing paths to explicitly ignore for any destructive actions
-  -N, --include-destructive-file=<value>  file listing paths to explicitly include for any destructive actions
-  -W, --ignore-whitespace                 ignore git diff whitespace (space, tab, eol) changes
-  -a, --api-version=<value>               salesforce metadata API version, default to sfdx-project.json
-                                          "sourceApiVersion" attribute or latest version
-  -d, --generate-delta                    generate delta files in [--output-dir] folder
-  -f, --from=<value>                      (required) commit sha from where the diff is done
-  -i, --ignore-file=<value>               file listing paths to explicitly ignore for any diff actions
-  -n, --include-file=<value>              file listing paths to explicitly include for any diff actions
-  -o, --output-dir=<value>                [default: ./output] source package specific output
-  -r, --repo-dir=<value>                  [default: ./] git repository location
-  -s, --source-dir=<value>...             [default: ./] source folders focus location relative to --repo-dir
-  -t, --to=<value>                        [default: HEAD] commit sha to where the diff is done
+  -D, --ignore-destructive-file=<value>       file listing paths to explicitly ignore for any destructive actions
+  -M, --additional-metadata-registry=<value>  file containing additional metadata definitions to add to the registry
+  -N, --include-destructive-file=<value>      file listing paths to explicitly include for any destructive actions
+  -W, --ignore-whitespace                     ignore git diff whitespace (space, tab, eol) changes
+  -a, --api-version=<value>                   salesforce metadata API version, default to sfdx-project.json
+                                              "sourceApiVersion" at --to or latest version
+  -b, --merge-base                            diff from the merge base of --from and --to instead of --from itself (git
+                                              three-dot semantics)
+  -c, --changes-manifest=<value>              path to a JSON file grouping changed components by kind (add, modify,
+                                              delete, rename); setting this flag also enables git rename detection
+  -d, --generate-delta                        generate delta files in [--output-dir] folder
+  -f, --from=<value>                          (required) commit sha from where the diff is done
+  -i, --ignore-file=<value>                   file listing paths to explicitly ignore for any diff actions
+  -n, --include-file=<value>                  file listing paths to explicitly include for any diff actions
+  -o, --output-dir=<value>                    [default: ./output] source package specific output
+  -r, --repo-dir=<value>                      [default: ./] git repository location
+  -s, --source-dir=<value>...                 [default: ./] source folders focus location relative to --repo-dir
+  -t, --to=<value>                            [default: HEAD] commit sha to where the diff is done
 
 GLOBAL FLAGS
   --flags-dir=<value>  Import flag values from a directory.
@@ -179,11 +188,13 @@ EXAMPLES
   $ sf sgd source delta --from "origin/development" --output-dir incremental
   - Build incremental manifest and source from the development branch
   $ sf sgd source delta --from "origin/development" --generate-delta --output-dir incremental
+  - Build incremental manifest from where the current branch diverged from main
+  $ sf sgd source delta --from "main" --merge-base --output-dir incremental
 
 FLAG DESCRIPTIONS
   -a, --api-version=<value>
 
-    salesforce metadata API version, default to sfdx-project.json "sourceApiVersion" attribute or latest version
+    salesforce metadata API version, default to sfdx-project.json "sourceApiVersion" at --to or latest version
 
     Override the api version used for api requests made by this command
 
@@ -196,6 +207,10 @@ FLAG DESCRIPTIONS
     * If the folder exists, its contents will be processed.
     * If the folder doesn't exist, it usually won't show any output—unless the folder was recently deleted and is part
     of a diff, in which case changes may still be picked up.
+
+    Each value must be a literal repository-relative path: wildcards (`*`, `?`, `[`), git pathspec magic (`:(...)`),
+    absolute paths, `..` and the empty string are all rejected. Matching is rooted at the repository root, so
+    `--source-dir force-app` does not match `nested/force-app/...`.
 ```
 
 _See code: [src/commands/sgd/source/delta.ts](https://github.com/scolladon/sfdx-git-delta/blob/main/src/commands/sgd/source/delta.ts)_
@@ -220,7 +235,9 @@ sf sgd source delta --from "HEAD~1" # right git shortcut with windows because it
 In CI/CD pipelines, for most of the CI/CD providers, the checkout operation fetches only the last commit of the branch currently evaluated.
 You need to fetch all the needed commits as the plugin needs access to the branch being compared.
 Example for Github action checkout [here](https://github.com/actions/checkout#fetch-all-history-for-all-tags-and-branches).
-If you use `-n` (`--include-file`) with metadata contained inside files you will need to have the full repo locally for the command to fully work.
+With `--merge-base [-b]`, a shallow clone is an even sharper trap: `--from` and `--to` can each resolve to a valid commit while their histories still don't connect within the fetched depth, so SGD reports "no merge base found" even though the refs themselves are fine. Fetch enough history for the two branches to actually share an ancestor, not just enough for each ref to resolve.
+
+GitHub Actions' `pull_request` trigger checks out a synthetic merge commit whose parent already **is** the base branch tip, so `merge-base(HEAD, main)` resolves to `main`'s tip and `--merge-base` silently becomes a no-op (`--from main --merge-base` behaves like `--from main`). If you need true divergence semantics in that context, target the PR head commit directly — `--to <head sha>` (from the `pull_request` event payload) — or check out `ref: <head sha>` instead of the default merge ref.
 
 In CI/CD pipelines, branches are not checked out locally when the repository is cloned, so you must specify the remote prefix.
 If you do not specify the remote in CI context, the git pointer check will raise an error (as the branch is not created locally).
@@ -250,7 +267,7 @@ It is the user responsibility to ensure LFS content is present when the plugin i
 
 ### Use cases
 
-Any git sha pointer is supported: commit sha, branch, tag, git expression (HEAD, etc.).
+Any git sha pointer is supported as long as it resolves to a commit: commit sha, branch, tag (an annotated tag is followed to the commit it points at), git expression (`HEAD`, `HEAD~1`, etc.). A tree or blob expression such as `HEAD^{tree}` or `HEAD:path` is rejected with an error naming the flag and the value you typed.
 
 `--from` parameter is the base commit (the first, the oldest, the closest)
 `--to` parameter is the target commit (the last, the youngest, the farthest)
@@ -273,11 +290,13 @@ sf sgd source delta --to develop --from main --output-dir .
 ```
 
 - **Comparing branches (from a common ancestor)**
-  To compare the `develop` branch since its common ancestor with the `main` branch (i.e. ignoring the changes performed in the `main` branch after `develop` creation):
+  To compare the `develop` branch since its common ancestor with the `main` branch (i.e. ignoring the changes performed in the `main` branch after `develop` creation), use `--merge-base [-b]`:
 
 ```sh
-sf sgd source delta --to develop --from $(git merge-base develop main) --output-dir .
+sf sgd source delta --to develop --from main --merge-base --output-dir .
 ```
+
+This is equivalent to `git diff main...develop` (three-dot, common-ancestor semantics). Unlike the `$(git merge-base ...)` shell form, `--merge-base` resolves inside `--repo-dir` and needs no shell — the shell form always resolves in the current directory regardless of `--repo-dir`.
 
 ## Walkthrough
 
@@ -422,10 +441,36 @@ Then it is possible to deploy the `change-sources` folder using `force:source:de
 sf project deploy start -p change-sources
 ```
 
+With `--generate-delta`, when a bundle of `lwc/`, `aura/`, `genAiFunctions/` or `uiBundles/` is copied, every file and every non-bundle folder (e.g. `__mocks__/`) directly in that same folder is copied too, from `--to`, so tooling (ESLint, Jest, Code Analyzer) run on the output folder sees the same config. Unchanged sibling bundles are not copied, and nothing is added to `package.xml` or `destructiveChanges.xml`. `--ignore-file` patterns apply to these files like any copied file. To deploy the output, exclude non-deployable folders with a [`.forceignore`](https://developer.salesforce.com/docs/platform/sfdx/guide/ignore-files.html).
+
+`--generate-delta` copies only files tracked in git at `--to`. Build output is usually not committed (e.g. a `UIBundle`'s `outputDir`, `dist/`), so build it in the output folder before deploying that folder, or build in the project and deploy with `--manifest <output>/package/package.xml`.
+
+> 💡 Start each run with an empty output folder. SGD writes the delta into `--output-dir` but never deletes what is already there, so files left by a previous run stay in the folder, and deploying the folder with `-p` deploys them too:
+>
+> ```sh
+> rm -rf changed-sources && mkdir changed-sources
+> sf sgd source delta --from "HEAD~1" --output-dir changed-sources/ --generate-delta
+> ```
+
 ### Exclude some metadata only from destructiveChanges.xml
 
 The `--ignore-file [-i]` parameter allows you to specify an [ignore file](https://git-scm.com/docs/gitignore) to filter the
 element on the diff to ignore. SGD ignores every diff line matching the pattern from the ignore file specified in the `--ignore-file [-i]`. `package.xml` generation, `destructiveChanges.xml` generation and `--delta-generate` will ignore those lines.
+
+Moving a component into a directory `--ignore-file [-i]` covers is treated as a move, not a deletion: SGD holds the ignored addition and, when nothing else of that component is visible at `--to`, cancels the matching deletion so neither manifest gets an entry. If the component still has a file outside the ignored patterns at `--to`, the ignored copy is stale and the deletion is reported as usual.
+
+```sh
+# ignorefile
+force-app/recycle-bin/**
+
+$ git mv force-app/main/default/classes/AccountService.cls force-app/recycle-bin/classes/AccountService.cls
+$ git mv force-app/main/default/classes/AccountService.cls-meta.xml force-app/recycle-bin/classes/AccountService.cls-meta.xml
+$ git commit -m "retire AccountService"
+
+$ sf sgd source delta --from HEAD~1 --ignore-file ignorefile
+```
+
+Before this behavior, `destructiveChanges.xml` listed `ApexClass/AccountService` and `package.xml` was empty. Now both are empty: the class moved into a directory SGD ignores, it wasn't deleted.
 
 Sometimes you may need to have two different ignore policies. One for the `package.xml` and another one for `destructiveChanges.xml` files. This is where the `--ignore-destructive-file [-D]` option comes handy!
 Use the `--ignore-destructive-file` parameter to specify a dedicated ignore file to handle deletions. It will apply to metadata listed in the `destructiveChanges.xml`. In other words, this will override the `--ignore-file [-i]` parameter for deleted items.
@@ -445,7 +490,52 @@ $ sf sgd source delta --from commit --ignore-destructive-file destructiveignore
 
 ```
 
+`--ignore-destructive-file [-D]` also covers sub-components deleted inside a modified file (a label removed from `CustomLabels.labels-meta.xml`, a workflow rule removed from a `.workflow-meta.xml`, etc.), while the additions and modifications of that same file still reach `package.xml`. Patterns match file paths, so a pattern matching `CustomLabels.labels-meta.xml` keeps every label deleted from that file out of `destructiveChanges.xml`, not a single label.
+
+`--ignore-destructive-file [-D]` does not affect the move detection described above. Whether a moved addition can cancel its deletion is decided purely against the `--ignore-file [-i]` patterns — the same file that held the addition in the first place — never the destructive-only one. A permissive `--ignore-destructive-file [-D]` does not turn the move back into a destructive change: as long as the component has no file outside `--ignore-file [-i]`'s patterns at `--to`, the deletion still cancels.
+
+If SGD cannot read the file listing at `--to`, the move check is skipped, the deletion is reported as usual, and SGD emits a warning noting the check could not run.
+
 Note: when only using the `--ignore-file [-i]` parameter (and not `--ignore-destructive-file [-D]`) the plugin will apply it to added/changed/deleted elements.
+
+Independently of any ignore file, SGD also keeps components of a type the Metadata API cannot delete — today only `RecordType` — out of `destructiveChanges.xml` on every route: an ordinary deletion, a rename, and `--include-destructive-file` alike. A destructive entry for one of these is a component failure (`Cannot delete record type through API`) that fails the whole deployment. The component is not deleted anywhere; it is only omitted from the manifest SGD would otherwise emit, so it remains in the target org until you remove it by hand in Setup. SGD raises a warning naming the type and the affected members:
+
+```
+Warning: The Metadata API cannot delete 'RecordType' components, so destructiveChanges.xml omits 'Account.Alpha'. Remove them from the target org manually in Setup.
+```
+
+### Moved components
+
+A component moved to another directory is not a change: SGD recognizes the move and leaves it out of `package.xml` and `destructiveChanges.xml`, so a refactoring commit does not redeploy (or delete) what did not change. A move is suppressed when all of these hold:
+
+- the deleted and the added files declare the same type and member;
+- every file is identical byte for byte, and the files keep the same layout relative to each other;
+- the component is complete: the move carries every file of the component;
+- the component stays in the same package directory of `sfdx-project.json`, each side being read at its own revision (when neither revision has an `sfdx-project.json`, all paths count as one package directory);
+- the source is visible to the ignore files: a source under `--ignore-file [-i]`, or only under `--ignore-destructive-file [-D]`, is deployed as usual. A destination under `--ignore-destructive-file [-D]` alone is still suppressed.
+
+```sh
+$ git mv force-app/main/default/classes/AccountService.cls force-app/shared/classes/AccountService.cls
+$ git mv force-app/main/default/classes/AccountService.cls-meta.xml force-app/shared/classes/AccountService.cls-meta.xml
+$ git commit -m "move AccountService"
+
+$ sf sgd source delta --from HEAD~1
+```
+
+Both manifests are empty. A move that also edits a file, leaves a file behind, or crosses package directories is not a pure move: it is reported as an addition and a deletion, as before.
+
+Labels are different, because a `CustomLabels` file holds many components. When a labels file is moved inside a package directory (deleted at one path, added at another), SGD compares the labels of all the `CustomLabels` files of that package directory before and after the change: labels that only moved are not redeployed, changed or added labels reach `package.xml`, and a label gone from every file reaches `destructiveChanges.xml`.
+
+```xml
+<!-- before: force-app/main/labels/CustomLabels.labels-meta.xml   has L1, L2 -->
+<!-- after:  force-app/shared/labels/CustomLabels.labels-meta.xml has L1     -->
+```
+
+The file moved and `L2` was removed: `package.xml` stays empty and `destructiveChanges.xml` lists `CustomLabel/L2`. Merging two moved labels files into one gives the same result: only the labels that were changed or added reach `package.xml`, only the labels that vanished reach `destructiveChanges.xml`. Labels files edited in place, with no file moved, are compared file by file, as before.
+
+A label moved to a file of another package directory is not a move: every label of the moved file deploys. With `--ignore-file [-i]`, a labels file matched by the pattern is out of the comparison and a label moved into it emits nothing; with `--ignore-destructive-file [-D]`, labels still deploy and only the deletions are filtered. A labels file whose package directory changed between `--from` and `--to` is left out of the comparison. Other types stored in one file (workflows, sharing rules...) follow the same rule file by file.
+
+If `sfdx-project.json` or the file listing cannot be read at either revision, the move check is skipped for the run, moved components are deployed as if they had changed, and SGD emits a warning that names the cause.
 
 ### Explicitly including specific files for inclusion or destruction regardless of diff
 
@@ -457,7 +547,7 @@ As with `--ignore-file`, you may need different policies for the `package.xml` a
 
 Use the `--include-destructive-file` parameter to specify a dedicated include file to handle deletions. Related metadata will appear in the `destructiveChanges.xml` output.
 
-/!\ In order to work properly with metadata contained inside files (Labels, Workflow, MatchingRules, etc) the local repo must have the full historic.
+For metadata contained inside files (Labels, Workflow, MatchingRules, etc.), every element the file holds at `--to` is included: in `package.xml` with `--include-file`, in `destructiveChanges.xml` with `--include-destructive-file`. The file's history plays no part, so a shallow clone is enough.
 
 Consider the following:
 
@@ -506,15 +596,100 @@ $ tree
 $ sf sgd source delta --from commit --source-dir force-app/unpackaged/admin --source-dir force-app/unpackaged/ui
 ```
 
+Each `--source-dir` value is a **literal** repository-relative folder (or file) path, matched from the repository root — `--source-dir force-app` matches `force-app/...` but never `nested/force-app/...`. A trailing slash or a leading `./` is accepted and canonicalised (`force-app/`, `./force-app` and `force-app` all scope the same folder).
+
+Wildcards (`*`, `?`, `[`), git pathspec magic (`:(exclude)…`, `:!…`, `:(glob)…`, …), absolute paths, `..`, and the empty string are all rejected with an error — `--source-dir` never matches a glob pattern. For pattern matching, repeat `--source-dir` once per folder, or use `--include-file [-n]` / `--ignore-file [-i]` (gitignore-spec patterns) instead.
+
 > The ignored patterns specified using `--ignore-file [-i]` and `--ignore-destructive-file [-D]` still apply.
 > The `--source-dir` path must be relative to the `--repo-dir` path
 
-### Generate a comma-separated list of the added and modified Apex classes
+### Scope delta generation to the sfdx-project.json package directories
 
-Depending on your testing strategy, [you may want to generate a comma-separated list of the added and modified Apex classes](https://github.com/scolladon/sfdx-git-delta/issues/126). This list can feed the `sf project deploy start --testlevel RunSpecifiedTests` command, for example.
-To cover this need, parse the content of the package.xml file produced by SGD using [yq](https://github.com/kislyuk/yq):
+SGD intentionally works without an `sfdx-project.json` and treats the whole repository as in scope. As a result, files living outside your declared package directories (for example `.claude/` metadata templates, samples or tooling fixtures) are picked up as soon as they change.
 
-`xq . < package/package.xml | jq '.Package.types | [.] | flatten | map(select(.name=="ApexClass")) | .[] | .members | [.] | flatten | map(select(. | index("*") | not)) | unique | join(",")'`
+When you want the delta to cover **only** the package directories declared in `sfdx-project.json`, feed each of them to the repeatable `--source-dir [-s]` parameter. Anything outside those directories is then excluded:
+
+```sh
+sf sgd source delta --from baseline --to HEAD --output-dir ./delta --generate-delta \
+  $(jq -r '.packageDirectories[] | "--source-dir", .path' sfdx-project.json)
+```
+
+[jq](https://jqlang.github.io/jq/) reads every `packageDirectories[].path` entry and expands it into a `--source-dir` argument. `sfdx-project.json` package directory paths commonly carry a trailing slash (e.g. `"force-app/"`); since `--source-dir` canonicalises trailing slashes away, this recipe works unchanged whether or not your `packageDirectories[].path` entries end in `/`.
+
+> See [Scoping delta generation to specific folders](#scoping-delta-generation-to-specific-folders) for the `--source-dir` behavior.
+> Prefer `--ignore-file [-i]` when you only need to skip a few known paths (e.g. `**/.claude/**`) without coupling to `sfdx-project.json`.
+
+### Run specified tests using the SGD manifest
+
+Depending on your testing strategy, you may want to run only the Apex tests related to the delta instead of every local test. Three options use the `package.xml` produced by SGD to drive the test selection:
+
+#### 1. Build the test list from the added and modified Apex classes
+
+[Generate a space-separated list of the added and modified Apex classes](https://github.com/scolladon/sfdx-git-delta/issues/126) by parsing the `package.xml` produced by SGD with [yq](https://github.com/kislyuk/yq):
+
+```sh
+TESTS=$(xq . < package/package.xml | jq -r '.Package.types | [.] | flatten | map(select(.name=="ApexClass")) | .[] | .members | [.] | flatten | map(select(. | index("*") | not)) | unique | join(" ")')
+sf project deploy start -x package/package.xml --test-level RunSpecifiedTests --tests $TESTS
+```
+
+`--tests` expects a space-separated list, so `$TESTS` is left unquoted to expand into one argument per class. This only works when the delta contains the test classes themselves, or when your test class names can be derived from the changed classes.
+
+#### 2. Resolve tests from annotations with apex-test-list
+
+The [apex-test-list](https://github.com/renatoliveira/apex-test-list) plugin (by [renatoliveira](https://github.com/renatoliveira)) reads `@Tests:` / `@TestSuites:` annotations in your Apex classes and resolves the tests to run for the components listed in the SGD manifest:
+
+```apex
+// @Tests: AccountServiceTest, AccountTriggerTest
+public class AccountService { }
+```
+
+```sh
+echo y | sf plugins install apextestlist
+sf sgd source delta --to "HEAD" --from "HEAD~1" --output-dir "."
+sf project deploy start -x package/package.xml --test-level RunSpecifiedTests $(sf apextests list -x package/package.xml --format sf)
+```
+
+#### 3. Let Salesforce pick with RunRelevantTests
+
+Salesforce's [`RunRelevantTests`](https://help.salesforce.com/s/articleView?id=release-notes.rn_apex_run_relevant_tests.htm&release=260&type=5) test level (beta, Spring '26) analyzes the deployment payload server-side and runs only the tests relevant to it. Deploy the SGD manifest with it.
+
+### Review-centric: list components by change kind
+
+Package managers (1GP, unlocked, managed) and release reviewers often need to distinguish **newly added** components from **modified** ones — adding a new component to a managed package is a 1-way door that binds all subscribers. SGD groups `git diff` into Salesforce components, but its `package.xml` bundles additions and modifications together (as required for deployment).
+
+Use `--changes-manifest [-c]` to emit an additional JSON file that groups components by change kind. The file is written alongside `package.xml` / `destructiveChanges.xml` (no changes to the deployment manifests themselves).
+
+Two forms:
+
+```sh
+# Bare flag: writes to <output-dir>/changes.manifest.json
+sf sgd source delta --from "origin/development" --to HEAD --output-dir incremental --changes-manifest
+
+# Explicit path: resolved against cwd (or used as-is when absolute), same as --ignore-file
+sf sgd source delta --from "origin/development" --to HEAD --changes-manifest reports/changes.json
+```
+
+Produces (bare form example) `incremental/changes.manifest.json`. Setting `--changes-manifest` also turns on git's `-M` rename detection for this run, so components renamed at the file level show up in their own bucket instead of being split into a fake delete+add pair. A rename lands in the `rename` bucket only when both sides are components the run itself detected; renaming a file that is not a component (e.g. a `.txt` inside `classes/`) leaves both manifests and buckets exactly as without the flag. Default sgd runs (without the flag) keep the pre-feature behaviour — renames still appear as a delete on the old path + an add on the new path.
+
+```json
+{
+  "add":    { "ApexClass": ["BrandNewClass"], "CustomObject": ["NewObject__c"] },
+  "modify": { "ApexClass": ["ExistingClass"], "CustomLabels": ["MyApp.Label1"] },
+  "delete": { "ApexTrigger": ["OldTrigger"] },
+  "rename": { "ApexClass": [{ "from": "OldName", "to": "NewName" }] }
+}
+```
+
+`package.xml` still lists `NewName` and `destructiveChanges.xml` still lists `OldName` for renames — the deployment contract is unchanged, and the manifests are identical whether or not `--changes-manifest` is set. Both sides of a rename still pass through the ignore files: a `from` path covered by `--ignore-destructive-file` keeps its member out of `destructiveChanges.xml`, a `to` path covered by `--ignore-file` keeps its member out of `package.xml`, and the change is then reported in `changes.manifest.json` as a plain addition or deletion rather than a rename: an ignored `from` leaves `to` in the `add` bucket, an ignored `to` leaves `from` in the `delete` bucket. When the move keeps the component name, the deletion is cancelled against the ignored addition and neither side is reported at all. A pure move (see [Moved components](#moved-components)) appears in no bucket.
+
+Two default-configuration behaviours changed with no dedicated changelog entry — the kind of thing you notice the first time you diff a JSON manifest across the upgrade:
+
+- a **renamed** record type is still reported in the `rename` bucket, but its former name is no longer emitted into `destructiveChanges.xml` — that entry previously made the whole deployment fail;
+- a **deleted** record type now appears in the `delete` bucket, where previously it appeared nowhere.
+
+Both are consequences of the undeletable-component warning described above: `RecordType` (today's only such type) is kept out of `destructiveChanges.xml`, but still reported in `changes.manifest.json` for review.
+
+Works for file-backed metadata, in-file sub-components (CustomLabels members, Workflow rules, etc.), decomposed metadata, in-resource bundles and in-folder metadata.
 
 ### Condition deployment on package.xml and destructiveChange content
 
@@ -549,9 +724,11 @@ import sgd from 'sfdx-git-delta'
 const work = await sgd({
   to: '', // commit sha to where the diff is done. [default : "HEAD"]
   from: '', // (required) commit sha from where the diff is done. [default : git rev-list --max-parents=0 HEAD]
+  mergeBase: false, // (required) resolve `from` to the merge base of `from`/`to` first. [default : false]
   output: '', // source package specific output. [default : "./output"]
-  apiVersion: '', // salesforce API version. [default : latest]
+  apiVersion: undefined, // salesforce API version, as a number (e.g. 67). [default : sfdx-project.json "sourceApiVersion" at --to, else latest]
   repo: '', // git repository location. [default : "."]
+  source: ['.'], // (required) one or more repo-relative folders to scope the diff to; '.' (or an empty array) means the whole repository
 })
 
 console.log(JSON.stringify(work))
@@ -621,6 +798,48 @@ Example to delete the Flow `Set_Account_Description` :
 sf project deploy start -x package.xml --post-destructive-changes destructiveChangesPost.xml
 ```
 
+### Add custom metadata types
+
+If you need to handle metadata types that are not (yet) supported by the standard registry, you can provide a JSON file containing the definitions using the `--additional-metadata-registry` flag.
+
+The file must contain an array of metadata definitions:
+
+```json
+[
+  {
+    "xmlName": "CustomThing",
+    "suffix": "thing",
+    "directoryName": "things",
+    "inFolder": false,
+    "metaFile": false
+  }
+]
+```
+
+Then run the command:
+
+```sh
+sf sgd source delta --from "HEAD~1" --additional-metadata-registry ./my-registry.json
+```
+
+### Decomposed Metadata Types
+
+SGD supports Salesforce [decomposed metadata source format](https://developer.salesforce.com/docs/atlas.en-us.sfdx_dev.meta/sfdx_dev/sfdx_dev_ws_decomposed_md_types.htm) beta features. When these features are enabled in your `sfdx-project.json`, metadata types are split into individual files instead of a single monolithic file. SGD detects the file layout automatically and generates the correct `package.xml` entries.
+
+Supported decomposed presets:
+
+| Preset | Parent Type | Notes |
+|--------|-------------|-------|
+| `decomposePermissionSetBeta` | PermissionSet | Each child (field permissions, class accesses, etc.) in its own subdirectory |
+| `decomposePermissionSetBeta2` | PermissionSet | Flat files + `objectSettings/` subdirectory |
+| `decomposeCustomLabelsBeta` | CustomLabels | Individual `.label` files |
+| `decomposeCustomLabelsBeta2` | CustomLabels | Individual `.label` files (flat layout) |
+| `decomposeWorkflowBeta` | Workflow | Each child (alerts, field updates, rules, etc.) in its own subdirectory |
+| `decomposeSharingRulesBeta` | SharingRules | Each child (criteria, owner, guest rules) in its own subdirectory |
+| `decomposeExternalServiceRegistrationBeta` | ExternalServiceRegistration | `.yaml` schema + `-meta.xml` definition; a change to either redeploys the registration, both files are copied with `--generate-delta` |
+
+No additional configuration is needed — SGD reads the file structure from the git diff and resolves the metadata types accordingly.
+
 ### Debugging
 
 SGD is using the [Salesforce CLI logging system](https://developer.salesforce.com/docs/atlas.en-us.sfdx_setup.meta/sfdx_setup/sfdx_dev_cli_log_messages.htm) to log information. You can control the logging level by setting the `SF_LOG_LEVEL` environment variable. You can redirect the logging in the terminal using `DEBUG=sfdx-git-delta`.
@@ -631,13 +850,6 @@ example:
 DEBUG=sfdx-git-delta SF_LOG_LEVEL=trace sf sgd source delta --from "HEAD~1" --to "HEAD"
 ```
 
-## Complementary Plugins
-
-These plugins have been designed to work with SGD:
-
-- [apex-test-list](https://github.com/renatoliveira/apex-test-list) - Developer: [renatoliveira](https://github.com/renatoliveira) - This plugin determines the specified Apex tests by reading test annotations made anywhere inside your Apex classes. You can have this plugin scan the package.xml created by SGD to determine the required Apex tests to run during deployment.
-- [apex-tests-git-delta](https://github.com/mcarvin8/apex-tests-git-delta) - Developer: [mcarvin8](https://github.com/mcarvin8) - This plugin determines the specified Apex tests by reading the commit messages in the commit range. You can use the same `--from` and `--to` commit hashes when using SGD and apex-tests-git-delta to determine the required Apex tests to run during deployment.
-
 ## Changelog
 
 [changelog.md](CHANGELOG.md) is available for consultation.
@@ -645,12 +857,12 @@ These plugins have been designed to work with SGD:
 ## Built With
 
 - [fast-xml-parser](https://github.com/NaturalIntelligence/fast-xml-parser) - Validate XML, Parse XML to JS/JSON and vise versa, or parse XML to Nimn rapidly without C/C++ based libraries and no callback
+- [flexible-xml-parser](https://github.com/nodable/flexible-xml-parser) - Fastest XML parser in pure JS with pluggable output builders and value parsers
 - [fs-extra](https://github.com/jprichardson/node-fs-extra) - Node.js: extra methods for the fs object like copy(), remove(), mkdirs().
 - [ignore](https://github.com/kaelzhang/node-ignore#readme) - is a manager, filter and parser which implemented in pure JavaScript according to the .gitignore spec 2.22.1.
 - [lodash](https://github.com/lodash/lodash) - A modern JavaScript utility library delivering modularity, performance & extras.
 - [MegaLinter](https://megalinter.io) - Open-Source tool for CI/CD workflows that analyzes the consistency of your code, IAC, configuration, and scripts
 - [simple-git](https://github.com/steveukx/git-js) - A light weight interface for running git commands in any node.js application.
-- [xmlbuilder2](https://github.com/oozcitak/xmlbuilder2) - An XML builder for node.js.
 
 ## Used by 
 

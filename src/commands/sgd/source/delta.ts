@@ -1,13 +1,17 @@
+import { join } from 'node:path/posix'
+
 import { Flags, SfCommand } from '@salesforce/sf-plugins-core'
 
 import {
+  CHANGES_MANIFEST_BARE_MARKER,
+  CHANGES_MANIFEST_DEFAULT_FILENAME,
   OUTPUT_DEFAULT_VALUE,
   REPO_DEFAULT_VALUE,
   SOURCE_DEFAULT_VALUE,
   TO_DEFAULT_VALUE,
 } from '../../../constant/cliConstants.js'
 import sgd from '../../../main.js'
-import type { Config } from '../../../types/config.js'
+import type { ConfigInput } from '../../../types/config.js'
 import type { SgdResult } from '../../../types/sgdResult.js'
 import { log } from '../../../utils/LoggingDecorator.js'
 import { Logger } from '../../../utils/LoggingService.js'
@@ -31,6 +35,10 @@ export default class SourceDeltaGenerate extends SfCommand<SgdResult> {
       char: 't',
       summary: messages.getMessage('flags.to.summary'),
       default: TO_DEFAULT_VALUE,
+    }),
+    'merge-base': Flags.boolean({
+      char: 'b',
+      summary: messages.getMessage('flags.merge-base.summary'),
     }),
     'generate-delta': Flags.boolean({
       char: 'd',
@@ -89,6 +97,17 @@ export default class SourceDeltaGenerate extends SfCommand<SgdResult> {
       aliases: ['include-destructive'],
       deprecateAliases: true,
     }),
+    'additional-metadata-registry': Flags.file({
+      char: 'M',
+      summary: messages.getMessage(
+        'flags.additional-metadata-registry.summary'
+      ),
+      exists: true,
+    }),
+    'changes-manifest': Flags.string({
+      char: 'c',
+      summary: messages.getMessage('flags.changes-manifest.summary'),
+    }),
     'ignore-whitespace': Flags.boolean({
       char: 'W',
       summary: messages.getMessage('flags.ignore-whitespace.summary'),
@@ -99,12 +118,41 @@ export default class SourceDeltaGenerate extends SfCommand<SgdResult> {
     }),
   }
 
+  // oclif's string flags require a value. To let users pass `-c` without a
+  // value (and fall back to <output>/changes.manifest.json), rewrite bare
+  // occurrences in argv into a known marker that we resolve after parsing.
+  protected static _expandBareChangesManifest(argv: string[]): string[] {
+    const aliases = new Set(['--changes-manifest', '-c'])
+    const result: string[] = []
+    for (let i = 0; i < argv.length; i++) {
+      const arg = argv[i]!
+      result.push(arg)
+      if (aliases.has(arg)) {
+        const next = argv[i + 1]
+        if (next === undefined || next.startsWith('-')) {
+          result.push(CHANGES_MANIFEST_BARE_MARKER)
+        }
+      }
+    }
+    return result
+  }
+
+  /* v8 ignore start -- oclif command entry: behaviour covered via NUT tests (delta.nut.ts) */
   @log
   public async run(): Promise<SgdResult> {
+    this.argv = SourceDeltaGenerate._expandBareChangesManifest(this.argv)
     const { flags } = await this.parse(SourceDeltaGenerate)
 
-    const config: Config = {
+    const rawChangesManifest = flags['changes-manifest']
+    const changesManifest =
+      rawChangesManifest === CHANGES_MANIFEST_BARE_MARKER
+        ? join(flags['output-dir'], CHANGES_MANIFEST_DEFAULT_FILENAME)
+        : rawChangesManifest
+
+    const config: ConfigInput = {
       apiVersion: parseInt(flags['api-version']!) || undefined,
+      additionalMetadataRegistryPath: flags['additional-metadata-registry'],
+      changesManifest,
       from: flags['from'],
       generateDelta: flags['generate-delta'],
       ignore: flags['ignore-file'],
@@ -112,6 +160,7 @@ export default class SourceDeltaGenerate extends SfCommand<SgdResult> {
       ignoreWhitespace: flags['ignore-whitespace'],
       include: flags['include-file'],
       includeDestructive: flags['include-destructive-file'],
+      mergeBase: flags['merge-base'],
       output: flags['output-dir'],
       repo: flags['repo-dir'],
       source: flags['source-dir'],
@@ -148,4 +197,5 @@ export default class SourceDeltaGenerate extends SfCommand<SgdResult> {
     this.spinner.stop(finalMessage)
     return output
   }
+  /* v8 ignore stop */
 }

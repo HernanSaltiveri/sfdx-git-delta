@@ -1,14 +1,19 @@
 'use strict'
-import { describe, expect, it, jest } from '@jest/globals'
+import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { DELETION } from '../../../../src/constant/gitConstants'
 import { METAFILE_SUFFIX } from '../../../../src/constant/metadataConstants'
 import { MetadataRepository } from '../../../../src/metadata/MetadataRepository'
+import { getDefinition } from '../../../../src/metadata/metadataManager'
 import SharedFolderHandler from '../../../../src/service/sharedFolderHandler'
-import type { Work } from '../../../../src/types/work'
-import { copyFiles } from '../../../../src/utils/fsHelper'
-import { getGlobalMetadata, getWork } from '../../../__utils__/globalTestHelper'
-
-jest.mock('../../../../src/utils/fsHelper')
+import type { Config } from '../../../../src/types/config'
+import {
+  CopyOperationKind,
+  ManifestTarget,
+} from '../../../../src/types/handlerResult'
+import { elementsOf } from '../../../__utils__/handlerResultView'
+import { createElement } from '../../../__utils__/testElement'
+import { getConfig, getContext } from '../../../__utils__/testWork'
 
 const objectType = {
   directoryName: 'discovery',
@@ -31,57 +36,239 @@ const basePath = `force-app/main/default/`
 const line = `A       ${basePath}${objectType}/${entityName}.${entityExtension}`
 const entityType = 'DiscoveryAIModel'
 
-let work: Work
+let config: Config
 beforeEach(() => {
-  jest.clearAllMocks()
-  work = getWork()
-  work.config.generateDelta = false
+  vi.clearAllMocks()
+  config = getConfig()
+  config.generateDelta = false
 })
 
 describe('SharedFolderHandler', () => {
   let globalMetadata: MetadataRepository
   beforeAll(async () => {
-    globalMetadata = await getGlobalMetadata()
+    globalMetadata = await getDefinition({})
   })
 
   it('should add the metadata component under the right type to the package', async () => {
     // Arrange
-    const sut = new SharedFolderHandler(line, objectType, work, globalMetadata)
+    const { changeType, element } = createElement(
+      line,
+      objectType,
+      globalMetadata
+    )
+    const sut = new SharedFolderHandler(
+      changeType,
+      element,
+      getContext({ config })
+    )
 
     // Act
-    await sut.handleAddition()
+    const result = await sut.collectAddition()
 
     // Assert
-    expect(work.diffs.package.get(entityType)!.size).toEqual(1)
-    expect(work.diffs.package.get(entityType)).toEqual(new Set([entityName]))
+    expect(elementsOf(result)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          target: ManifestTarget.Package,
+          type: entityType,
+          member: entityName,
+        }),
+      ])
+    )
   })
-  describe('when it should generate output file', () => {
-    beforeEach(() => {
-      work.config.generateDelta = true
-    })
-    it('should add and copy the metadata', async () => {
-      const sut = new SharedFolderHandler(
-        line,
+
+  it('Given extension with resolved type but not matching suffix, When collect, Then _isProcessable returns true via resolvedType', async () => {
+    // Arrange
+    const { changeType, element } = createElement(
+      line,
+      objectType,
+      globalMetadata
+    )
+    const sut = new SharedFolderHandler(
+      changeType,
+      element,
+      getContext({ config })
+    )
+
+    // Act
+    const result = await sut.collect()
+
+    // Assert
+    expect(elementsOf(result)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          target: ManifestTarget.Package,
+          type: entityType,
+          member: entityName,
+        }),
+      ])
+    )
+  })
+
+  it('Given unknown extension without resolved type, When collect, Then _isProcessable returns false and result is empty', async () => {
+    // Arrange
+    const unknownLine = `A       ${basePath}${objectType}/Test.unknownext`
+    const { changeType, element } = createElement(
+      unknownLine,
+      objectType,
+      globalMetadata
+    )
+    const sut = new SharedFolderHandler(
+      changeType,
+      element,
+      getContext({ config })
+    )
+
+    // Act
+    const result = await sut.collect()
+
+    // Assert
+    expect(elementsOf(result)).toHaveLength(0)
+    expect(result.copies).toHaveLength(0)
+  })
+
+  it('Given unknown extension without resolved type, When getElementDescriptor is called directly, Then it throws (kills L23 NoCoverage defensive guard)', async () => {
+    // Arrange — TypeHandlerFactory only ever routes to SharedFolderHandler
+    // via a resolvable extension, so getElementDescriptor's guard is
+    // unreachable through the normal call chain; still a genuine safety
+    // net that must fail loudly rather than returning a bogus descriptor.
+    const unknownLine = `A       ${basePath}${objectType}/Test.unknownext`
+    const { changeType, element } = createElement(
+      unknownLine,
+      objectType,
+      globalMetadata
+    )
+    const sut = new SharedFolderHandler(
+      changeType,
+      element,
+      getContext({ config })
+    )
+
+    // Act & Assert
+    expect(() => sut.getElementDescriptor()).toThrow(
+      `SharedFolderHandler: resolvedType is missing for ${element.fullPath}`
+    )
+  })
+
+  describe('when extension has no matching type', () => {
+    it('should not add to package on addition', async () => {
+      // Arrange
+      const unknownExtLine = `A       ${basePath}${objectType}/Test.unknownext`
+      const { changeType, element } = createElement(
+        unknownExtLine,
         objectType,
-        work,
         globalMetadata
+      )
+      const sut = new SharedFolderHandler(
+        changeType,
+        element,
+        getContext({ config })
       )
 
       // Act
-      await sut.handleAddition()
+      const result = await sut.collectAddition()
 
       // Assert
-      expect(work.diffs.package.get(entityType)!.size).toEqual(1)
-      expect(work.diffs.package.get(entityType)).toEqual(new Set([entityName]))
-      expect(copyFiles).toHaveBeenCalledTimes(2)
-      expect(copyFiles).toHaveBeenCalledWith(
-        work.config,
-        `${basePath}${objectType}/${entityName}.${entityExtension}`
+      expect(elementsOf(result)).toEqual([])
+    })
+
+    it('should not add to package on deletion', async () => {
+      // Arrange
+      const unknownExtLine = `${DELETION}       ${basePath}${objectType}/Test.unknownext`
+      const { changeType, element } = createElement(
+        unknownExtLine,
+        objectType,
+        globalMetadata
       )
-      expect(copyFiles).toHaveBeenCalledWith(
-        work.config,
-        `${basePath}${objectType}/${entityName}.${entityExtension}${METAFILE_SUFFIX}`
+      const sut = new SharedFolderHandler(
+        changeType,
+        element,
+        getContext({ config })
       )
+
+      // Act
+      const result = await sut.collectDeletion()
+
+      // Assert
+      expect(elementsOf(result)).toEqual([])
+      expect(result.copies).toEqual([])
+    })
+  })
+
+  describe('collectDeletion', () => {
+    it('should add destructive manifest entry when extension matches', async () => {
+      // Arrange
+      const deletionLine = `${DELETION}       ${basePath}${objectType}/${entityName}.${entityExtension}`
+      const { changeType, element } = createElement(
+        deletionLine,
+        objectType,
+        globalMetadata
+      )
+      const sut = new SharedFolderHandler(
+        changeType,
+        element,
+        getContext({ config })
+      )
+
+      // Act
+      const result = await sut.collectDeletion()
+
+      // Assert
+      expect(elementsOf(result)).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            target: ManifestTarget.DestructiveChanges,
+            type: entityType,
+            member: entityName,
+          }),
+        ])
+      )
+      expect(result.copies).toEqual([])
+    })
+  })
+  describe('when it should generate output file', () => {
+    beforeEach(() => {
+      config.generateDelta = true
+    })
+    it('should add and copy the metadata', async () => {
+      // Arrange
+      const { changeType, element } = createElement(
+        line,
+        objectType,
+        globalMetadata
+      )
+      const sut = new SharedFolderHandler(
+        changeType,
+        element,
+        getContext({ config })
+      )
+
+      // Act
+      const result = await sut.collectAddition()
+
+      // Assert
+      expect(elementsOf(result)).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            target: ManifestTarget.Package,
+            type: entityType,
+            member: entityName,
+          }),
+        ])
+      )
+      expect(result.copies).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            kind: CopyOperationKind.GitCopy,
+            path: `${basePath}${objectType}/${entityName}.${entityExtension}`,
+          }),
+          expect.objectContaining({
+            kind: CopyOperationKind.GitCopy,
+            path: `${basePath}${objectType}/${entityName}.${entityExtension}${METAFILE_SUFFIX}`,
+          }),
+        ])
+      )
+      expect(result.copies).toHaveLength(2)
     })
   })
 })

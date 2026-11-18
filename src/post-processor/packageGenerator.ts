@@ -1,66 +1,67 @@
 'use strict'
 
-import { join } from 'node:path/posix'
-
-import { outputFile } from 'fs-extra'
+import { createWriteStream, promises as fsPromises } from 'node:fs'
+import { dirname, join } from 'node:path/posix'
+import type { Manifest } from '../types/work.js'
+import type ChangeSet from '../utils/changeSet.js'
 import { log } from '../utils/LoggingDecorator.js'
 import PackageBuilder from '../utils/packageHelper.js'
-import BaseProcessor from './baseProcessor.js'
+import BaseProcessor, {
+  emptyOutcome,
+  type ProcessorOutcome,
+} from './baseProcessor.js'
 
 const DESTRUCTIVE_CHANGES_FILE_NAME = 'destructiveChanges'
 const PACKAGE_FILE_NAME = 'package'
 const XML_FILE_EXTENSION = 'xml'
 
+type WriteOp = {
+  filename: string
+  folder: string
+  manifest: Manifest
+}
+
 export default class PackageGenerator extends BaseProcessor {
   @log
-  public override async process() {
-    this._cleanPackages()
-    await this._buildPackages()
+  public override async process(changes: ChangeSet): Promise<ProcessorOutcome> {
+    const builder = new PackageBuilder(this.config)
+    // ChangeSet.forDestructiveManifest() already cancels delete entries that
+    // have been re-added or re-modified in the same diff — no local cleanup
+    // needed here.
+    const destructiveManifest = changes.forDestructiveManifest()
+    const packageManifest = changes.forPackageManifest()
+    const ops: WriteOp[] = [
+      {
+        filename: `${DESTRUCTIVE_CHANGES_FILE_NAME}.${XML_FILE_EXTENSION}`,
+        folder: DESTRUCTIVE_CHANGES_FILE_NAME,
+        manifest: destructiveManifest,
+      },
+      {
+        filename: `${PACKAGE_FILE_NAME}.${XML_FILE_EXTENSION}`,
+        folder: PACKAGE_FILE_NAME,
+        manifest: packageManifest,
+      },
+      {
+        filename: `${PACKAGE_FILE_NAME}.${XML_FILE_EXTENSION}`,
+        folder: DESTRUCTIVE_CHANGES_FILE_NAME,
+        manifest: new Map(),
+      },
+    ]
+    await Promise.all(ops.map(op => this._writeManifest(builder, op)))
+    return emptyOutcome()
   }
 
-  protected _cleanPackages() {
-    const additive = this.work.diffs[PACKAGE_FILE_NAME]
-    const destructive = this.work.diffs[DESTRUCTIVE_CHANGES_FILE_NAME]
-    for (const [type, members] of additive) {
-      if (destructive.has(type)) {
-        destructive.set(
-          type,
-          new Set(
-            [...destructive.get(type)!].filter(element => !members.has(element))
-          )
-        )
-        if (destructive.get(type)!.size === 0) {
-          destructive.delete(type)
-        }
-      }
-    }
-  }
-
-  protected async _buildPackages() {
-    const pc = new PackageBuilder(this.config)
-    await Promise.all(
-      [
-        {
-          filename: `${DESTRUCTIVE_CHANGES_FILE_NAME}.${XML_FILE_EXTENSION}`,
-          folder: DESTRUCTIVE_CHANGES_FILE_NAME,
-          manifest: this.work.diffs[DESTRUCTIVE_CHANGES_FILE_NAME],
-        },
-        {
-          filename: `${PACKAGE_FILE_NAME}.${XML_FILE_EXTENSION}`,
-          folder: PACKAGE_FILE_NAME,
-          manifest: this.work.diffs[PACKAGE_FILE_NAME],
-        },
-        {
-          filename: `${PACKAGE_FILE_NAME}.${XML_FILE_EXTENSION}`,
-          folder: DESTRUCTIVE_CHANGES_FILE_NAME,
-          manifest: new Map(),
-        },
-      ].map(op => {
-        return outputFile(
-          join(this.config.output, op.folder, op.filename),
-          pc.buildPackage(op.manifest) as string
-        )
-      })
-    )
+  private async _writeManifest(
+    builder: PackageBuilder,
+    op: WriteOp
+  ): Promise<void> {
+    const dst = join(this.config.output, op.folder, op.filename)
+    await fsPromises.mkdir(dirname(dst), { recursive: true })
+    const ws = createWriteStream(dst)
+    await builder.buildPackageStream(op.manifest, ws)
+    await new Promise<void>((resolve, reject) => {
+      /* v8 ignore next -- defensive: createWriteStream's end-callback fires with err only on synchronous fd write failure */
+      ws.end((err?: Error | null) => (err ? reject(err) : resolve()))
+    })
   }
 }

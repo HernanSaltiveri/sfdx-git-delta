@@ -1,0 +1,145 @@
+import { type DiffChange, toSimilarityPercent } from '@scolladon/tsgit'
+
+import { TAB } from '../constant/cliConstants.js'
+import { PATH_SEP } from '../constant/fsConstants.js'
+import {
+  ADDITION,
+  DELETION,
+  MODIFICATION,
+  RENAMED,
+} from '../constant/gitConstants.js'
+import { treatPathSep } from '../utils/fsUtils.js'
+import { lineOf } from '../utils/gitLine.js'
+import type { Pathspec } from '../utils/pathspec.js'
+
+export const ROOT_PATHS = new Set(['', '.', './'])
+
+const GITLINK_MODE = '160000'
+
+// A path is in scope when it equals a scope, or descends from one — i.e. any
+// ancestor-directory prefix of the path is itself a scope. Walking the
+// path's own prefixes against a Set is O(depth) per path regardless of scope
+// count, replacing a naive O(scopes) scan per path. Slicing at each
+// separator (rather than a naive `startsWith(scope + '/')` scan) is what
+// keeps a sibling like `lwc/foobar` from matching scope `lwc/foo`.
+//
+// A factory, not a cache: `hasRoot` and `paths` derive from the scopes'
+// contents, so a caller with a hot loop over the same scopes (buildTreeIndex)
+// builds the matcher once and calls it per path, while a fresh-array-per-call
+// site (streamArchive's per-file `[path]`) hoists its own single matcher out
+// of its loop instead of paying a reference-keyed cache's lookup cost on
+// every miss.
+export const buildScopeMatcher = (
+  scopes: readonly string[]
+): ((path: string) => boolean) => {
+  const hasRoot = scopes.some(scope => ROOT_PATHS.has(scope))
+  const paths = new Set(scopes)
+  return (path: string): boolean => {
+    if (hasRoot) return true
+
+    let separatorIndex = path.indexOf(PATH_SEP)
+    while (separatorIndex !== -1) {
+      if (paths.has(path.slice(0, separatorIndex))) return true
+      separatorIndex = path.indexOf(PATH_SEP, separatorIndex + 1)
+    }
+    return paths.has(path)
+  }
+}
+
+// One-shot check for callers with no hot loop to hoist a matcher out of
+// (toDiffLines/keepSide: one call per side per change).
+export const inScope = (path: string, scopes: readonly string[]): boolean =>
+  buildScopeMatcher(scopes)(path)
+
+const keepSide = (
+  mode: string,
+  path: string,
+  scopes: readonly string[]
+): boolean =>
+  mode !== GITLINK_MODE && (scopes.length === 0 || inScope(path, scopes))
+
+export const hasRootScope = (scopes: readonly Pathspec[]): boolean =>
+  scopes.some(scope => ROOT_PATHS.has(scope))
+
+export const nonRootScopes = (scopes: readonly Pathspec[]): Pathspec[] =>
+  scopes.filter(scope => !ROOT_PATHS.has(scope))
+
+// git prints rename similarity as a zero-padded three-digit percent (R087).
+const similarityPercent = (similarity: { score: number }): string =>
+  String(toSimilarityPercent(similarity.score)).padStart(3, '0')
+
+// The facade diff takes no pathspec, so `-- <source>` scoping is replicated
+// per side. Gitlink changes are skipped (submodule pointer moves are not
+// deployable metadata) and `type-change`/`copy` entries are dropped for
+// parity with the subprocess `--diff-filter=AMD(R)`. A rename with only one
+// side in scope degrades to that side's A/D line, matching what the
+// subprocess pathspec does to a broken rename pair.
+export function* toDiffLines(
+  change: DiffChange,
+  scopes: readonly string[]
+): Generator<string> {
+  switch (change.type) {
+    case 'add':
+      if (keepSide(change.newMode, change.newPath, scopes)) {
+        yield lineOf(ADDITION, treatPathSep(change.newPath))
+      }
+      break
+    case 'delete':
+      if (keepSide(change.oldMode, change.oldPath, scopes)) {
+        yield lineOf(DELETION, treatPathSep(change.oldPath))
+      }
+      break
+    case 'modify':
+      if (
+        change.oldMode !== GITLINK_MODE &&
+        keepSide(change.newMode, change.path, scopes)
+      ) {
+        yield lineOf(MODIFICATION, treatPathSep(change.path))
+      }
+      break
+    case 'rename': {
+      const oldKept = keepSide(change.oldMode, change.oldPath, scopes)
+      const newKept = keepSide(change.newMode, change.newPath, scopes)
+      if (oldKept && newKept) {
+        yield `${RENAMED}${similarityPercent(change.similarity)}${TAB}${treatPathSep(change.oldPath)}${TAB}${treatPathSep(change.newPath)}`
+      } else if (newKept) {
+        yield lineOf(ADDITION, treatPathSep(change.newPath))
+      } else if (oldKept) {
+        yield lineOf(DELETION, treatPathSep(change.oldPath))
+      }
+      break
+    }
+  }
+}
+
+const GLOB_CHARS = /[*?[]/
+const REGEXP_SPECIALS = /[.+^${}()|\\\]]/g
+
+// Git pathspec semantics: a literal pathspec matches by directory prefix; a
+// pathspec containing wildcards uses wildmatch where `*` also crosses `/`
+// (no `:(glob)` magic). Callers mix both shapes (e.g. flow translations use
+// `<source>/*.translation-meta.xml`).
+export const buildPathspecMatcher = (
+  specs: string[]
+): ((path: string) => boolean) => {
+  // Git normalizes leading `./` (and the `.//*` shape produced by the
+  // default `./` source dir) away before matching; repo paths never carry
+  // either prefix.
+  const normalized = specs.map(spec =>
+    spec.replace(/^(\.\/)+/, '').replace(/^\/+/, '')
+  )
+  const literals = normalized.filter(spec => !GLOB_CHARS.test(spec))
+  const globs = normalized
+    .filter(spec => GLOB_CHARS.test(spec))
+    .map(spec => {
+      const escaped = spec
+        .replace(REGEXP_SPECIALS, '\\$&')
+        .replace(/\*/g, '.*')
+        .replace(/\?/g, '.')
+      return new RegExp(`^${escaped}$`)
+    })
+  const matchesLiteral = buildScopeMatcher(literals)
+  return (path: string): boolean =>
+    (literals.length > 0 && matchesLiteral(path)) ||
+    globs.some(glob => glob.test(path))
+}

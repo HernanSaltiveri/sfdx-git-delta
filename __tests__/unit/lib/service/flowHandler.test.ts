@@ -1,14 +1,17 @@
 'use strict'
-import { describe, expect, it, jest } from '@jest/globals'
+import { beforeAll, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { DELETION } from '../../../../src/constant/gitConstants'
 import { MetadataRepository } from '../../../../src/metadata/MetadataRepository'
+import { getDefinition } from '../../../../src/metadata/metadataManager'
 import FlowHandler from '../../../../src/service/flowHandler'
-import type { Work } from '../../../../src/types/work'
-import { getGlobalMetadata, getWork } from '../../../__utils__/globalTestHelper'
+import type { Config } from '../../../../src/types/config'
+import { ManifestTarget } from '../../../../src/types/handlerResult'
+import { elementsOf } from '../../../__utils__/handlerResultView'
+import { createElement } from '../../../__utils__/testElement'
+import { getConfig, getContext } from '../../../__utils__/testWork'
 
-jest.mock('../../../../src/utils/fsHelper')
-jest.mock('../../../../src/utils/MessageService')
+vi.mock('../../../../src/utils/fsHelper')
 
 const objectType = {
   directoryName: 'flows',
@@ -18,33 +21,38 @@ const objectType = {
   xmlName: 'Flow',
 }
 const basePath = `force-app/main/default/${objectType.directoryName}`
-let work: Work
+let config: Config
 beforeEach(() => {
-  jest.clearAllMocks()
-  work = getWork()
+  vi.clearAllMocks()
+  config = getConfig()
 })
 
 describe('flowHandler', () => {
   let globalMetadata: MetadataRepository
   beforeAll(async () => {
-    globalMetadata = await getGlobalMetadata()
+    globalMetadata = await getDefinition({})
   })
-  describe('when a flow is deleted', () => {
-    it('warns the user not to', async () => {
+  describe('collect', () => {
+    it('Given flow deletion, When collect, Then returns destructive manifest with warning', async () => {
       // Arrange
-      const sut = new FlowHandler(
+      const { changeType, element } = createElement(
         `${DELETION}       ${basePath}/MyFlow.${objectType.suffix}-meta.xml`,
         objectType,
-        work,
         globalMetadata
       )
-      expect(work.warnings.length).toBe(0)
+      const sut = new FlowHandler(changeType, element, getContext({ config }))
 
       // Act
-      await sut.handle()
+      const result = await sut.collect()
 
       // Assert
-      expect(work.warnings.length).toBe(1)
+      expect(elementsOf(result)).toHaveLength(1)
+      expect(elementsOf(result)[0].target).toBe(
+        ManifestTarget.DestructiveChanges
+      )
+      expect(elementsOf(result)[0].type).toBe('Flow')
+      expect(result.warnings).toHaveLength(1)
+      expect(result.warnings[0].message).toContain('MyFlow')
     })
   })
 })

@@ -1,27 +1,24 @@
-'use strict'
-import { access, readFile as fsReadFile, stat } from 'node:fs/promises'
-import { describe, expect, it, jest } from '@jest/globals'
-
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { PATH_SEP } from '../../../../src/constant/fsConstants'
 import {
-  dirExists,
-  fileExists,
+  fs,
   isSamePath,
   isSubDir,
+  outputFile,
   pathExists,
   readFile,
   sanitizePath,
   treatPathSep,
 } from '../../../../src/utils/fsUtils'
+import { Logger } from '../../../../src/utils/LoggingService'
 
-jest.mock('node:fs/promises')
-
-const mockedStat = jest.mocked(stat)
-const mockedReadFile = jest.mocked(fsReadFile)
-const mockedAccess = jest.mocked(access)
+const mockedReadFile = vi.spyOn(fs, 'readFile')
+const mockedAccess = vi.spyOn(fs, 'access')
+const mockedMkdir = vi.spyOn(fs, 'mkdir')
+const mockedWriteFile = vi.spyOn(fs, 'writeFile')
 
 beforeEach(() => {
-  jest.resetAllMocks()
+  vi.resetAllMocks()
 })
 
 describe('isSubDir', () => {
@@ -60,133 +57,58 @@ describe('isSubDir', () => {
     ['C:\\Foo', 'C:\\Foo\\Bar', false],
     ['C:\\Foo', 'C:\\Bar', false],
     ['C:\\Foo', 'D:\\Foo\\Bar', false],
-  ])(`should verify %s expect %s to be a subDir: %s`, (parent, child, expected) => {
-    // Arrange
+  ])(
+    `should verify %s expect %s to be a subDir: %s`,
+    (parent, child, expected) => {
+      // Arrange
 
-    // Act
-    const actual = isSubDir(parent, child)
+      // Act
+      const actual = isSubDir(parent, child)
 
-    // Assert
-    expect(actual).toBe(expected)
-  })
-})
-
-describe('dirExists', () => {
-  it('returns true when dir exist', async () => {
-    // Arrange
-    mockedStat.mockImplementation((() =>
-      Promise.resolve({
-        isDirectory: () => true,
-      })) as unknown as typeof stat)
-
-    // Act
-    const exist = await dirExists('test')
-
-    // Assert
-    expect(exist).toBe(true)
-  })
-
-  it('returns false when dir does not exist', async () => {
-    // Arrange
-    mockedStat.mockImplementation((() =>
-      Promise.resolve({
-        isDirectory: () => false,
-      })) as unknown as typeof stat)
-
-    // Act
-    const exist = await dirExists('test')
-
-    // Assert
-    expect(exist).toBe(false)
-  })
-
-  it('returns false when an exception occurs', async () => {
-    // Arrange
-    mockedStat.mockImplementation((() =>
-      Promise.reject(new Error('test'))) as unknown as typeof stat)
-
-    // Act
-    const exist = await dirExists('test')
-
-    // Assert
-    expect(exist).toBe(false)
-  })
-})
-
-describe('fileExists', () => {
-  it('returns true when file exist', async () => {
-    // Arrange
-    mockedStat.mockImplementation((() =>
-      Promise.resolve({
-        isFile: () => true,
-      })) as unknown as typeof stat)
-
-    // Act
-    const exist = await fileExists('test')
-
-    // Assert
-    expect(exist).toBe(true)
-  })
-
-  it('returns false when file does not exist', async () => {
-    // Arrange
-    mockedStat.mockImplementation((() =>
-      Promise.resolve({
-        isFile: () => false,
-      })) as unknown as typeof stat)
-
-    // Act
-    const exist = await fileExists('test')
-
-    // Assert
-    expect(exist).toBe(false)
-  })
-
-  it('returns false when an exception occurs', async () => {
-    // Arrange
-    mockedStat.mockImplementation((() =>
-      Promise.reject(new Error('test'))) as unknown as typeof stat)
-
-    // Act
-    const exist = await fileExists('test')
-
-    // Assert
-    expect(exist).toBe(false)
-  })
+      // Assert
+      expect(actual).toBe(expected)
+    }
+  )
 })
 
 describe('readFile', () => {
   describe('when readfile succeed', () => {
     beforeEach(() => {
       // Arrange
-      mockedReadFile.mockImplementationOnce((() =>
-        Promise.resolve('content')) as unknown as typeof mockedReadFile)
+      mockedReadFile.mockResolvedValue('content')
     })
-    it('should return the file', async () => {
+    it('should return the file content', async () => {
       // Act
-      const file = await readFile('path')
+      const sut = await readFile('path')
 
       // Assert
-      expect(file).toBeTruthy()
-      expect(mockedReadFile).toHaveBeenCalled()
+      expect(sut).toBe('content')
+    })
+
+    it('When called, Then passes encoding option to fs.readFile (not an empty object)', async () => {
+      // Arrange — the { encoding: UTF8_ENCODING } object at L45 is a
+      // mutation target: replacing it with {} drops the encoding, causing
+      // readFile to return a Buffer instead of a string. We assert the
+      // actual options object that was forwarded.
+      // Act
+      await readFile('path')
+
+      // Assert — second argument must include the encoding property
+      expect(mockedReadFile).toHaveBeenCalledWith(
+        'path',
+        expect.objectContaining({ encoding: 'utf8' })
+      )
     })
   })
 
   describe('when readfile throw', () => {
     beforeEach(() => {
       // Arrange
-      mockedReadFile.mockImplementationOnce((() =>
-        Promise.reject('Error')) as unknown as typeof mockedReadFile)
+      mockedReadFile.mockRejectedValue('Error')
     })
     it('should throw', async () => {
-      // Act
-      try {
-        await readFile('path')
-      } catch (err) {
-        // Assert
-        expect(err).toBeTruthy()
-        expect(mockedReadFile).toHaveBeenCalled()
-      }
+      // Act & Assert
+      await expect(readFile('path')).rejects.toBe('Error')
     })
   })
 })
@@ -309,12 +231,66 @@ describe('pathExists', () => {
   it('returns false when path is not accessible', async () => {
     // Arrange
     mockedAccess.mockRejectedValue(new Error('not accessible'))
-    const sut = pathExists
+    const debugSpy = vi
+      .spyOn(Logger, 'debug')
+      .mockImplementation((msg: unknown) => {
+        if (typeof msg === 'function') (msg as () => void)()
+      })
 
     // Act
-    const result = await sut('not/accessible/path')
+    const result = await pathExists('not/accessible/path')
 
     // Assert
     expect(result).toBe(false)
+    expect(debugSpy).toHaveBeenCalled()
+    debugSpy.mockRestore()
+  })
+})
+
+describe('outputFile', () => {
+  it('Given a destination and content, When called, Then mkdir is invoked recursively on the parent and writeFile writes the content', async () => {
+    // Arrange
+    mockedMkdir.mockResolvedValue(undefined as never)
+    mockedWriteFile.mockResolvedValue(undefined as never)
+
+    // Act
+    await outputFile('out/nested/dir/file.txt', 'payload')
+
+    // Assert
+    expect(mockedMkdir).toHaveBeenCalledWith('out/nested/dir', {
+      recursive: true,
+    })
+    expect(mockedWriteFile).toHaveBeenCalledWith(
+      'out/nested/dir/file.txt',
+      'payload'
+    )
+    // Ordering: mkdir must complete before writeFile is called so the parent
+    // directory exists. Kills the swap-order mutation.
+    const mkdirOrder = mockedMkdir.mock.invocationCallOrder[0]!
+    const writeOrder = mockedWriteFile.mock.invocationCallOrder[0]!
+    expect(mkdirOrder).toBeLessThan(writeOrder)
+  })
+
+  it('Given a Buffer payload, When called, Then writeFile receives the same Buffer reference', async () => {
+    // Arrange
+    mockedMkdir.mockResolvedValue(undefined as never)
+    mockedWriteFile.mockResolvedValue(undefined as never)
+    const buf = Buffer.from([0x01, 0x02, 0x03])
+
+    // Act
+    await outputFile('out/binary.bin', buf)
+
+    // Assert
+    expect(mockedWriteFile).toHaveBeenCalledWith('out/binary.bin', buf)
+  })
+
+  it('Given mkdir rejects, When called, Then the error propagates and writeFile is not invoked', async () => {
+    // Arrange
+    const boom = new Error('permission denied')
+    mockedMkdir.mockRejectedValue(boom as never)
+
+    // Act / Assert
+    await expect(outputFile('out/file.txt', 'payload')).rejects.toBe(boom)
+    expect(mockedWriteFile).not.toHaveBeenCalled()
   })
 })

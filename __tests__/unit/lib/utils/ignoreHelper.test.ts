@@ -1,5 +1,14 @@
 'use strict'
-import { describe, expect, it, jest } from '@jest/globals'
+import {
+  afterAll,
+  afterEach,
+  beforeAll,
+  beforeEach,
+  describe,
+  expect,
+  it,
+  vi,
+} from 'vitest'
 
 import {
   ADDITION,
@@ -12,40 +21,67 @@ import {
   buildIgnoreHelper,
   buildIncludeHelper,
   IgnoreHelper,
-  resetIgnoreInstance,
-  resetIncludeInstance,
 } from '../../../../src/utils/ignoreHelper'
+import { sourceDirs } from '../../../__utils__/sourceDirs'
 
-jest.mock('../../../../src/utils/fsUtils')
-const mockedReadFile = jest.mocked(readFile)
+vi.mock('../../../../src/utils/fsUtils', async orig => ({
+  ...(await orig<typeof import('../../../../src/utils/fsUtils')>()),
+  readFile: vi.fn(),
+}))
+const mockedReadFile = vi.mocked(readFile)
+
+const getConfig = (): Config => ({
+  to: '',
+  from: '',
+  mergeBase: false,
+  output: '',
+  source: sourceDirs('.'),
+  ignore: '',
+  ignoreDestructive: '',
+  apiVersion: 0,
+  repo: '',
+  ignoreWhitespace: false,
+  generateDelta: false,
+  include: '',
+  includeDestructive: '',
+})
 
 describe('ignoreHelper', () => {
   let sut: IgnoreHelper
-  const config: Config = {
-    to: '',
-    from: '',
-    output: '',
-    source: [''],
-    ignore: '',
-    ignoreDestructive: '',
-    apiVersion: 0,
-    repo: '',
-    ignoreWhitespace: false,
-    generateDelta: false,
-    include: '',
-    includeDestructive: '',
-  }
+  let config: Config
+  beforeEach(() => {
+    config = getConfig()
+    vi.resetAllMocks()
+  })
+
+  // Both helpers are cached in static fields, so a suite that builds one leaves
+  // it for whatever runs next: the next suite's beforeAll gets the cached
+  // instance back instead of building its own, and asserts against another
+  // suite's rules. Clearing after every test is what makes this file
+  // order-independent.
   afterEach(() => {
-    jest.resetAllMocks()
+    IgnoreHelper.resetIgnoreInstance()
+    IgnoreHelper.resetIncludeInstance()
   })
   describe('buildIgnoreHelper', () => {
+    it('returns cached instance on subsequent calls', async () => {
+      // Arrange
+      const firstCall = await buildIgnoreHelper(config)
+
+      // Act
+      const secondCall = await buildIgnoreHelper(config)
+
+      // Assert
+      expect(secondCall).toBe(firstCall)
+    })
+
     describe('when config does not have ignore neither destructive ignore', () => {
       beforeAll(async () => {
         // Arrange
-        sut = await buildIgnoreHelper(config)
+        sut = await buildIgnoreHelper(getConfig())
       })
       afterAll(() => {
-        resetIgnoreInstance()
+        IgnoreHelper.resetIgnoreInstance()
       })
 
       it('global helper should be defined', () => {
@@ -55,7 +91,7 @@ describe('ignoreHelper', () => {
 
       it('destructive helper should be defined', () => {
         // Assert
-        expect(sut['destructiveIgnore']).toBeDefined()
+        expect(sut.keep(`${DELETION} path/to/file.ext`)).toBe(true)
       })
 
       it.each([
@@ -70,17 +106,32 @@ describe('ignoreHelper', () => {
         // Assert
         expect(keep).toBe(true)
       })
+
+      it.each([
+        `${DELETION} path/to/objects/Account/recordTypes/IT.recordType-meta.xml`,
+      ])(
+        'should keep deleted "%s" line: no built-in destructive pattern exists',
+        line => {
+          // Act
+          const keep = sut.keep(line)
+
+          // Assert
+          expect(keep).toBe(true)
+        }
+      )
     })
     describe('when config does not have ignore and have destructive ignore', () => {
       beforeAll(async () => {
         // Arrange
         mockedReadFile.mockResolvedValue('*ignoreFile*')
-        config.ignoreDestructive = 'path'
-        sut = await buildIgnoreHelper(config)
+        sut = await buildIgnoreHelper({
+          ...getConfig(),
+          ignoreDestructive: 'path',
+        })
       })
 
       afterAll(() => {
-        resetIgnoreInstance()
+        IgnoreHelper.resetIgnoreInstance()
       })
 
       it('global helper should be defined', () => {
@@ -90,40 +141,34 @@ describe('ignoreHelper', () => {
 
       it('destructive helper should be defined', () => {
         // Assert
-        expect(sut['destructiveIgnore']).toBeDefined()
+        expect(sut.keep(`${DELETION} path/to/file.ext`)).toBe(true)
       })
 
       it.each([
         `${DELETION} path/to/file.ext`,
         `${DELETION} anotherPath/to/file.ext`,
         `${DELETION} path/to/anotherFile.ext`,
-      ])('should keep deleted "%s" line not matching ignoreDestructive pattern', line => {
-        // Act
-        const keep = sut.keep(line)
+      ])(
+        'should keep deleted "%s" line not matching ignoreDestructive pattern',
+        line => {
+          // Act
+          const keep = sut.keep(line)
 
-        // Assert
-        expect(keep).toBe(true)
-      })
+          // Assert
+          expect(keep).toBe(true)
+        }
+      )
 
-      it.each([
-        `${DELETION} path/to/ignoreFile.ext`,
-      ])('should not keep deleted "%s" line matching ignoreDestructive pattern', line => {
-        // Act
-        const keep = sut.keep(line)
+      it.each([`${DELETION} path/to/ignoreFile.ext`])(
+        'should not keep deleted "%s" line matching ignoreDestructive pattern',
+        line => {
+          // Act
+          const keep = sut.keep(line)
 
-        // Assert
-        expect(keep).toBe(false)
-      })
-
-      it.each([
-        `${DELETION} path/to/objects/Account/recordTypes/IT.recordType-meta.xml`,
-      ])('should not keep deleted "%s" line matching default ignore pattern', line => {
-        // Act
-        const keep = sut.keep(line)
-
-        // Assert
-        expect(keep).toBe(false)
-      })
+          // Assert
+          expect(keep).toBe(false)
+        }
+      )
 
       it.each([
         `${ADDITION} path/to/file.ext`,
@@ -140,12 +185,11 @@ describe('ignoreHelper', () => {
       beforeAll(async () => {
         // Arrange
         mockedReadFile.mockImplementation(() => Promise.resolve('*ignoreFile*'))
-        config.ignore = 'path'
-        sut = await buildIgnoreHelper(config)
+        sut = await buildIgnoreHelper({ ...getConfig(), ignore: 'path' })
       })
 
       afterAll(() => {
-        resetIgnoreInstance()
+        IgnoreHelper.resetIgnoreInstance()
       })
 
       it('helper should have globalInstance', () => {
@@ -155,7 +199,7 @@ describe('ignoreHelper', () => {
 
       it('helper should have destructiveInstance (with default ignore)', () => {
         // Assert
-        expect(sut['destructiveIgnore']).toBeDefined()
+        expect(sut.keep(`${DELETION} path/to/file.ext`)).toBe(true)
       })
 
       it.each([
@@ -206,13 +250,16 @@ describe('ignoreHelper', () => {
 
       it.each([
         `${DELETION} path/to/objects/Account/recordTypes/IT.recordType-meta.xml`,
-      ])('should not keep deleted "%s" line matching default ignore pattern', line => {
-        // Act
-        const keep = sut.keep(line)
+      ])(
+        'should keep deleted "%s" line: no built-in destructive pattern exists',
+        line => {
+          // Act
+          const keep = sut.keep(line)
 
-        // Assert
-        expect(keep).toBe(false)
-      })
+          // Assert
+          expect(keep).toBe(true)
+        }
+      )
     })
     describe('when config has ignore and destructive ignore', () => {
       beforeAll(async () => {
@@ -224,7 +271,7 @@ describe('ignoreHelper', () => {
       })
 
       afterAll(() => {
-        resetIgnoreInstance()
+        IgnoreHelper.resetIgnoreInstance()
       })
 
       it('helper should have globalInstance', () => {
@@ -234,7 +281,7 @@ describe('ignoreHelper', () => {
 
       it('helper should have destructiveInstance', () => {
         // Assert
-        expect(sut['destructiveIgnore']).toBeDefined()
+        expect(sut.keep(`${DELETION} path/to/file.ext`)).toBe(true)
       })
 
       it.each([
@@ -285,12 +332,41 @@ describe('ignoreHelper', () => {
 
       it.each([
         `${DELETION} path/to/objects/Account/recordTypes/IT.recordType-meta.xml`,
-      ])('should not keep deleted "%s" line matching default ignore pattern', line => {
-        // Act
-        const keep = sut.keep(line)
+      ])(
+        'should keep deleted "%s" line: no built-in destructive pattern exists',
+        line => {
+          // Act
+          const keep = sut.keep(line)
 
-        // Assert
-        expect(keep).toBe(false)
+          // Assert
+          expect(keep).toBe(true)
+        }
+      )
+    })
+
+    describe('Given a missing ignore file', () => {
+      afterEach(() => {
+        IgnoreHelper.resetIgnoreInstance()
+      })
+
+      it('When readFile rejects, Then buildIgnoreHelper propagates the rejection', async () => {
+        // Arrange
+        IgnoreHelper.resetIgnoreInstance()
+        const error = Object.assign(
+          new Error(
+            "ENOENT: no such file or directory, open '.missing-ignore-file'"
+          ),
+          { code: 'ENOENT' }
+        )
+        mockedReadFile.mockRejectedValue(error)
+        const buildFromConfig = buildIgnoreHelper
+
+        // Act & Assert
+        await expect(
+          buildFromConfig({ ...getConfig(), ignore: '.missing-ignore-file' })
+        ).rejects.toMatchObject({
+          code: 'ENOENT',
+        })
       })
     })
   })
@@ -310,10 +386,10 @@ describe('ignoreHelper', () => {
     describe('when config does not have include neither destructive include', () => {
       beforeAll(async () => {
         // Arrange
-        sut = await buildIncludeHelper(config)
+        sut = await buildIncludeHelper(getConfig())
       })
       afterAll(() => {
-        resetIncludeInstance()
+        IgnoreHelper.resetIncludeInstance()
       })
 
       it('global helper should be defined', () => {
@@ -323,7 +399,7 @@ describe('ignoreHelper', () => {
 
       it('destructive helper should be defined', () => {
         // Assert
-        expect(sut['destructiveIgnore']).toBeDefined()
+        expect(sut.keep(`${DELETION} path/to/file.ext`)).toBe(true)
       })
 
       it.each([
@@ -343,12 +419,14 @@ describe('ignoreHelper', () => {
       beforeAll(async () => {
         // Arrange
         mockedReadFile.mockImplementation(() => Promise.resolve('*ignoreFile*'))
-        config.includeDestructive = 'path'
-        sut = await buildIncludeHelper(config)
+        sut = await buildIncludeHelper({
+          ...getConfig(),
+          includeDestructive: 'path',
+        })
       })
 
       afterAll(() => {
-        resetIncludeInstance()
+        IgnoreHelper.resetIncludeInstance()
       })
 
       it('global helper should be defined', () => {
@@ -358,30 +436,34 @@ describe('ignoreHelper', () => {
 
       it('destructive helper should be defined', () => {
         // Assert
-        expect(sut['destructiveIgnore']).toBeDefined()
+        expect(sut.keep(`${DELETION} path/to/file.ext`)).toBe(true)
       })
 
       it.each([
         `${DELETION} path/to/file.ext`,
         `${DELETION} anotherPath/to/file.ext`,
         `${DELETION} path/to/anotherFile.ext`,
-      ])('should keep deleted "%s" line not matching includeDestructive pattern', line => {
-        // Act
-        const keep = sut.keep(line)
+      ])(
+        'should keep deleted "%s" line not matching includeDestructive pattern',
+        line => {
+          // Act
+          const keep = sut.keep(line)
 
-        // Assert
-        expect(keep).toBe(true)
-      })
+          // Assert
+          expect(keep).toBe(true)
+        }
+      )
 
-      it.each([
-        `${DELETION} path/to/ignoreFile.ext`,
-      ])('should not keep deleted "%s" line matching includeDestructive pattern', line => {
-        // Act
-        const keep = sut.keep(line)
+      it.each([`${DELETION} path/to/ignoreFile.ext`])(
+        'should not keep deleted "%s" line matching includeDestructive pattern',
+        line => {
+          // Act
+          const keep = sut.keep(line)
 
-        // Assert
-        expect(keep).toBe(false)
-      })
+          // Assert
+          expect(keep).toBe(false)
+        }
+      )
 
       it.each([
         `${ADDITION} path/to/file.ext`,
@@ -398,13 +480,15 @@ describe('ignoreHelper', () => {
       beforeAll(async () => {
         // Arrange
         mockedReadFile.mockImplementation(() => Promise.resolve('*ignoreFile*'))
-        config.include = 'path'
-        config.includeDestructive = ''
-        sut = await buildIncludeHelper(config)
+        sut = await buildIncludeHelper({
+          ...getConfig(),
+          include: 'path',
+          includeDestructive: '',
+        })
       })
 
       afterAll(() => {
-        resetIncludeInstance()
+        IgnoreHelper.resetIncludeInstance()
       })
 
       it('helper should have globalInstance', () => {
@@ -414,7 +498,7 @@ describe('ignoreHelper', () => {
 
       it('helper should have destructiveInstance', () => {
         // Assert
-        expect(sut['destructiveIgnore']).toBeDefined()
+        expect(sut.keep(`${DELETION} path/to/file.ext`)).toBe(true)
       })
 
       it.each([
@@ -468,13 +552,15 @@ describe('ignoreHelper', () => {
         // Arrange
         mockedReadFile.mockResolvedValueOnce('*ignoreFile*')
         mockedReadFile.mockResolvedValueOnce('*ignoreFile*')
-        config.include = 'path'
-        config.includeDestructive = 'path'
-        sut = await buildIncludeHelper(config)
+        sut = await buildIncludeHelper({
+          ...getConfig(),
+          include: 'path',
+          includeDestructive: 'path',
+        })
       })
 
       afterAll(() => {
-        resetIncludeInstance()
+        IgnoreHelper.resetIncludeInstance()
       })
 
       it('helper should have globalInstance', () => {
@@ -484,7 +570,7 @@ describe('ignoreHelper', () => {
 
       it('helper should have destructiveInstance', () => {
         // Assert
-        expect(sut['destructiveIgnore']).toBeDefined()
+        expect(sut.keep(`${DELETION} path/to/file.ext`)).toBe(true)
       })
 
       it.each([
